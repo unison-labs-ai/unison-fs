@@ -1,2 +1,20 @@
 /target/
 Cargo.lock
+
+# Environment / secrets — never commit real values
+.env
+.env.local
+*.env
+
+# Editor artifacts
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Test databases and daemon sockets
+*.db
+*.db-wal
+*.db-shm
+unisonfs.sock
