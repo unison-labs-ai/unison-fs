@@ -399,7 +399,7 @@ fn vfs_attr_to_nfs(attr: &crate::vfs::FileAttr) -> nfsserve::nfs::fattr3 {
 
     fattr3 {
         ftype,
-        mode: (attr.mode & 0o7777) as u32,
+        mode: attr.mode & 0o7777,
         nlink: attr.nlink,
         uid: attr.uid,
         gid: attr.gid,

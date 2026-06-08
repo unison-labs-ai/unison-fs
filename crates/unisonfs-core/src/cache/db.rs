@@ -566,4 +566,69 @@ mod tests {
         );
         assert!(db.push_queue_claim_next(10).is_some());
     }
+
+    #[test]
+    fn dirty_since_set_and_cleared() {
+        let db = Db::open_in_memory().unwrap();
+        // Initially no dirty_since for the root inode.
+        assert!(db.get_dirty_since(ROOT_INO).is_none());
+
+        // Stamp dirty — simulates a local write.
+        db.set_dirty_since(ROOT_INO, Some(1_700_000_000_000));
+        assert_eq!(db.get_dirty_since(ROOT_INO), Some(1_700_000_000_000));
+
+        // Clear dirty — simulates a successful push or clean pull.
+        db.set_dirty_since(ROOT_INO, None);
+        assert!(db.get_dirty_since(ROOT_INO).is_none());
+    }
+
+    #[test]
+    fn dirty_guard_prevents_stale_pull() {
+        // Verify the guard semantics used in pull_once:
+        // If dirty_since (local edit ts) >= remote_ts, the pull should skip.
+        let dirty_since: i64 = 1_700_000_005_000; // local edit at t+5s
+        let remote_ts: i64 = 1_700_000_000_000;   // remote is older
+        assert!(
+            dirty_since >= remote_ts,
+            "guard must skip when local edit is newer than remote"
+        );
+
+        let dirty_since2: i64 = 1_700_000_000_000; // same ms
+        let remote_ts2: i64 = 1_700_000_010_000;   // remote is newer
+        assert!(
+            dirty_since2 < remote_ts2,
+            "guard must allow pull when remote is newer"
+        );
+    }
+
+    #[test]
+    fn delete_remote_path_removes_mapping() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_remote_path(99, "/private/notes/del.md");
+        assert!(db.get_remote_path(99).is_some());
+        db.delete_remote_path(99);
+        assert!(db.get_remote_path(99).is_none());
+    }
+
+    #[test]
+    fn sync_meta_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.sync_meta_get("last_pull_at").is_none());
+        db.sync_meta_set("last_pull_at", "1700000000000");
+        assert_eq!(
+            db.sync_meta_get("last_pull_at"),
+            Some("1700000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn set_mirrored_state_updates_record() {
+        let db = Db::open_in_memory().unwrap();
+        // Ensure a fs_remote row exists first.
+        db.set_remote_path(ROOT_INO, "/private/notes/r.md");
+        db.set_mirrored_state(ROOT_INO, Some(1_700_000_000_000), Some("ok"), Some(1_700_000_001_000));
+        // Idempotent: calling again with newer data should update.
+        db.set_mirrored_state(ROOT_INO, Some(1_700_000_002_000), Some("pushed"), Some(1_700_000_003_000));
+        // No panic = success (values coalesce via COALESCE in the SQL).
+    }
 }

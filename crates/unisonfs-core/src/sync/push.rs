@@ -12,6 +12,8 @@ use crate::cache::{Db, PushOp};
 const MAX_ATTEMPTS: i64 = 10;
 /// Base backoff in milliseconds.
 const BASE_BACKOFF_MS: i64 = 500;
+/// sync_meta key for the last successful push timestamp.
+const SYNC_META_LAST_PUSH_AT: &str = "last_push_at";
 
 /// Run the push loop until `shutdown` is notified.
 pub async fn run(
@@ -59,6 +61,30 @@ async fn drain_available(api: &ApiClient, db: &Db) {
             Ok(()) => {
                 tracing::debug!("push: {} succeeded (op={:?})", job.brain_path, job.op);
                 db.push_queue_finalize_success(&job.brain_path, now_ms);
+
+                // Record the successful push in sync_meta and update mirrored
+                // state on the inode.
+                db.sync_meta_set(SYNC_META_LAST_PUSH_AT, &now_ms.to_string());
+                if job.op == PushOp::Write {
+                    if let Some(content_ino) = job.content_ino {
+                        db.set_mirrored_state(
+                            content_ino,
+                            Some(now_ms),
+                            Some("pushed"),
+                            Some(now_ms),
+                        );
+                        // Clear dirty_since: the local edit is now on the server.
+                        db.set_dirty_since(content_ino, None);
+                    }
+                } else if job.op == PushOp::Delete {
+                    // Remote path is gone — clean up any stale mirrored record.
+                    // The inode entry itself was already removed by unlink; if
+                    // by any chance it still exists, clear its dirty flag.
+                    if let Some(ino) = db.ino_by_remote_path(&job.brain_path) {
+                        db.set_dirty_since(ino, None);
+                        db.delete_remote_path(ino);
+                    }
+                }
             }
             Err(e) => {
                 // Unrecoverable 4xx → poison

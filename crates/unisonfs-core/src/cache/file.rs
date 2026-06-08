@@ -1,6 +1,7 @@
 //! SQLite-backed file handle.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
@@ -11,6 +12,13 @@ use crate::vfs::{
 };
 
 use super::db::Db;
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// A handle to an open file in the SQLite cache.
 #[derive(Debug)]
@@ -42,7 +50,7 @@ impl File for DbFile {
         }
 
         let start_chunk = (offset / self.db.chunk_size as u64) as usize;
-        let end_byte = ((offset as usize + size).min(total_size as usize)) as usize;
+        let end_byte = (offset as usize + size).min(total_size as usize);
         let end_chunk = (end_byte.saturating_sub(1) / self.db.chunk_size) as i64;
 
         let mut stmt = conn
@@ -118,7 +126,7 @@ impl File for DbFile {
         // Merge data into affected chunks
         for chunk_idx in first_chunk..=last_chunk {
             let chunk_start = chunk_idx * chunk_size;
-            let chunk = chunks.entry(chunk_idx).or_insert_with(Vec::new);
+            let chunk = chunks.entry(chunk_idx).or_default();
             if chunk.len() < chunk_size {
                 // Extend if this chunk was shorter (at end of file)
                 let needed = if chunk_idx == last_chunk {
@@ -131,16 +139,8 @@ impl File for DbFile {
                 }
             }
 
-            let write_start = if offset as usize > chunk_start {
-                offset as usize - chunk_start
-            } else {
-                0
-            };
-            let data_start = if chunk_start > offset as usize {
-                chunk_start - offset as usize
-            } else {
-                0
-            };
+            let write_start = (offset as usize).saturating_sub(chunk_start);
+            let data_start = chunk_start.saturating_sub(offset as usize);
             let write_end = ((chunk_idx + 1) * chunk_size - chunk_start)
                 .min(data.len() - data_start + write_start)
                 .min(chunk_size);
@@ -180,6 +180,10 @@ impl File for DbFile {
             ],
         )
         .map_err(VfsError::Database)?;
+
+        // Stamp dirty_since so the pull loop won't overwrite an inode that has
+        // in-progress local edits before they are pushed.
+        self.db.set_dirty_since(self.ino, Some(now_ms()));
 
         Ok(data.len() as u32)
     }

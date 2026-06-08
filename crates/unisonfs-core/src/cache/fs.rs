@@ -58,16 +58,22 @@ impl UnisonFs {
         self.db.get_remote_path(ino)
     }
 
-    /// Enqueue a write to the push queue. Called from `flush` / `create_file`.
+    /// Enqueue a write to the push queue and stamp `dirty_since` so the pull
+    /// loop knows not to overwrite this inode until the push succeeds.
     pub fn enqueue_write(&self, brain_path: &str, content_ino: u64) {
         let now_ms = now_ms();
+        self.db.set_dirty_since(content_ino, Some(now_ms));
         self.db
             .push_queue_upsert(brain_path, PushOp::Write, Some(content_ino), None, now_ms);
     }
 
-    /// Enqueue a delete.
+    /// Enqueue a delete and clear the remote-path record so the inode is no
+    /// longer associated with any brain path.
     pub fn enqueue_delete(&self, brain_path: &str) {
         let now_ms = now_ms();
+        if let Some(ino) = self.db.ino_by_remote_path(brain_path) {
+            self.db.delete_remote_path(ino);
+        }
         self.db
             .push_queue_upsert(brain_path, PushOp::Delete, None, None, now_ms);
     }

@@ -1,12 +1,22 @@
 //! Pull loop — reconciles remote brain documents into the local cache.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
 
 use crate::api::{ApiClient, ListDocsReq};
 use crate::cache::{Db, UnisonFs};
+
+/// Key used in sync_meta to record when the last successful pull completed.
+const SYNC_META_LAST_PULL_AT: &str = "last_pull_at";
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Run the pull loop until `shutdown` is notified.
 pub async fn run(
@@ -33,7 +43,12 @@ pub async fn run(
 }
 
 /// Perform one pull cycle: list all documents and reconcile.
-async fn pull_once(api: &ApiClient, _db: &Db, fs: &UnisonFs) -> anyhow::Result<()> {
+async fn pull_once(api: &ApiClient, db: &Db, fs: &UnisonFs) -> anyhow::Result<()> {
+    // Log when the last pull completed (useful for diagnostics).
+    if let Some(last) = db.sync_meta_get(SYNC_META_LAST_PULL_AT) {
+        tracing::trace!("pull: last pull completed at {last}ms");
+    }
+
     tracing::debug!("pull: fetching document list");
 
     let resp = api
@@ -69,12 +84,28 @@ async fn pull_once(api: &ApiClient, _db: &Db, fs: &UnisonFs) -> anyhow::Result<(
 
         // Upsert the document into the local cache
         let content = doc.body_md.as_deref().unwrap_or("").as_bytes().to_vec();
-        if let Err(e) = fs.upsert_brain_doc(brain_path, &content) {
-            tracing::warn!("pull: failed to upsert {brain_path}: {e}");
-        } else {
-            tracing::trace!("pull: upserted {brain_path}");
+        match fs.upsert_brain_doc(brain_path, &content) {
+            Ok(ino) => {
+                // Record mirrored state for this inode: the remote updated_at
+                // timestamp and an "ok" status.
+                let remote_ms = parse_iso8601_ms(&doc.updated_at).ok();
+                let now = now_ms();
+                fs.db.set_mirrored_state(ino, remote_ms, Some("ok"), Some(now));
+                // A successfully mirrored inode is no longer dirty from the
+                // pull's perspective — clear dirty_since so future pull cycles
+                // can update it again.
+                fs.db.set_dirty_since(ino, None);
+                tracing::trace!("pull: upserted {brain_path} (ino={ino})");
+            }
+            Err(e) => {
+                tracing::warn!("pull: failed to upsert {brain_path}: {e}");
+            }
         }
     }
+
+    // Persist the timestamp of this completed pull so incremental logic or
+    // diagnostics can use it.
+    db.sync_meta_set(SYNC_META_LAST_PULL_AT, &now_ms().to_string());
 
     Ok(())
 }
