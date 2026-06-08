@@ -13,10 +13,10 @@ use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use fuser::{
-    Config, Errno, FileAttr as FuserAttr, FileHandle, FileType as FuserFileType, Filesystem,
-    FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyWrite, Request, SessionACL, WriteFlags,
+    BsdFileFlags, Config, Errno, FileAttr as FuserAttr, FileHandle, FileType as FuserFileType,
+    Filesystem, FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, Request, SessionACL, WriteFlags,
 };
 
 #[cfg(target_os = "linux")]
@@ -387,7 +387,7 @@ impl Filesystem for FuseAdapter {
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         use crate::vfs::{SetAttr, TimeOrNow};
@@ -427,15 +427,13 @@ pub fn mount(
     mount_path: &Path,
     rt: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
-    let config = Config {
-        mount_options: vec![
-            MountOption::FSName("unisonfs".to_string()),
-            MountOption::AutoUnmount,
-            MountOption::DefaultPermissions,
-        ],
-        acl: SessionACL::RootAndOwner,
-        ..Default::default()
-    };
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::FSName("unisonfs".to_string()),
+        MountOption::AutoUnmount,
+        MountOption::DefaultPermissions,
+    ];
+    config.acl = SessionACL::RootAndOwner;
     let adapter = FuseAdapter::new(fs, rt);
     fuser::mount2(adapter, mount_path, &config)?;
     Ok(())
