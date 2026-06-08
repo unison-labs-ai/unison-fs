@@ -74,6 +74,16 @@ pub struct FuseAdapter {
 }
 
 #[cfg(target_os = "linux")]
+impl std::fmt::Debug for FuseAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FuseAdapter")
+            .field("open_files_count", &self.open_files.lock().len())
+            .field("next_fh", &self.next_fh.load(std::sync::atomic::Ordering::Relaxed))
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl FuseAdapter {
     pub fn new(fs: Arc<dyn FileSystem + 'static>, rt: tokio::runtime::Handle) -> Self {
         Self {
