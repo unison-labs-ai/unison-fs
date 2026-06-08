@@ -1,0 +1,42 @@
+[package]
+name = "unisonfs-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "unisonfs core library — VFS trait, local SQLite cache, mount adapters, sync engine, Unison brain API client"
+
+[lib]
+name = "unisonfs_core"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+directories = { workspace = true }
+lru = { workspace = true }
+fs2 = "0.4"
+
+# Mount backends — target-gated
+# nfsserve compiles on both macOS and Linux (pure Rust).
+# fuser is Linux-only.
+[target.'cfg(unix)'.dependencies]
+nfsserve = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
