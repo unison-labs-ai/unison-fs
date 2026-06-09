@@ -10,6 +10,147 @@ use crate::cache::{Db, UnisonFs};
 
 /// Key used in sync_meta to record when the last successful pull completed.
 const SYNC_META_LAST_PULL_AT: &str = "last_pull_at";
+const SYNC_META_LAST_SEEN: &str = "last_seen_updated_at";
+
+/// Progress snapshot from a full or delta pull.
+#[derive(Debug, Clone, Copy)]
+pub struct PullProgress {
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_items: usize,
+    pub reconciled: usize,
+}
+
+/// Run one pass of the delta pull loop. Returns number of docs reconciled.
+pub async fn delta_pull(fs: &Arc<UnisonFs>) -> anyhow::Result<usize> {
+    let Some(api) = fs.api() else {
+        return Ok(0);
+    };
+
+    let last_seen = fs.db().sync_meta_get(SYNC_META_LAST_SEEN).unwrap_or_default();
+    let mut newest_seen = last_seen.clone();
+    let mut reconciled = 0usize;
+
+    let resp = api
+        .list_docs(&ListDocsReq {
+            prefix: None,
+            kind: Vec::new(),
+            tag: Vec::new(),
+            limit: Some(500),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("delta pull failed: {e}"))?;
+
+    for doc in &resp.documents {
+        if !last_seen.is_empty() && doc.updated_at.as_str() <= last_seen.as_str() {
+            continue;
+        }
+        let brain_path = &doc.path;
+        if let Some(ino) = fs.db().ino_by_remote_path(brain_path) {
+            if let Some(dirty_since) = fs.db().get_dirty_since(ino) {
+                if let Ok(remote_ts) = parse_iso8601_ms(&doc.updated_at) {
+                    if dirty_since >= remote_ts {
+                        continue;
+                    }
+                }
+            }
+        }
+        let content = doc.body_md.as_deref().unwrap_or("").as_bytes().to_vec();
+        if let Ok(ino) = fs.upsert_brain_doc(brain_path, &content) {
+            let remote_ms = parse_iso8601_ms(&doc.updated_at).ok();
+            let now = now_ms();
+            fs.db().set_mirrored_state(ino, remote_ms, Some("ok"), Some(now));
+            fs.db().set_dirty_since(ino, None);
+        }
+        reconciled += 1;
+        if doc.updated_at > newest_seen {
+            newest_seen = doc.updated_at.clone();
+        }
+    }
+
+    if !newest_seen.is_empty() && newest_seen != last_seen {
+        fs.db().sync_meta_set(SYNC_META_LAST_SEEN, &newest_seen);
+    }
+
+    Ok(reconciled)
+}
+
+/// Full pull (no watermark) — used at mount startup.
+pub async fn full_pull(fs: &Arc<UnisonFs>) -> anyhow::Result<usize> {
+    full_pull_inner(fs, None).await
+}
+
+pub async fn full_pull_with_progress<F>(
+    fs: &Arc<UnisonFs>,
+    mut on_progress: F,
+) -> anyhow::Result<usize>
+where
+    F: FnMut(PullProgress) + Send,
+{
+    full_pull_inner(fs, Some(&mut on_progress)).await
+}
+
+async fn full_pull_inner(
+    fs: &Arc<UnisonFs>,
+    mut on_progress: Option<&mut (dyn FnMut(PullProgress) + Send)>,
+) -> anyhow::Result<usize> {
+    let Some(api) = fs.api() else {
+        return Ok(0);
+    };
+
+    let resp = api
+        .list_docs(&ListDocsReq {
+            prefix: None,
+            kind: Vec::new(),
+            tag: Vec::new(),
+            limit: Some(500),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("full pull failed: {e}"))?;
+
+    let total = resp.documents.len();
+    let mut reconciled = 0usize;
+    let mut newest_seen = String::new();
+
+    for doc in &resp.documents {
+        let brain_path = &doc.path;
+        if let Some(ino) = fs.db().ino_by_remote_path(brain_path) {
+            if let Some(dirty_since) = fs.db().get_dirty_since(ino) {
+                if let Ok(remote_ts) = parse_iso8601_ms(&doc.updated_at) {
+                    if dirty_since >= remote_ts {
+                        continue;
+                    }
+                }
+            }
+        }
+        let content = doc.body_md.as_deref().unwrap_or("").as_bytes().to_vec();
+        if let Ok(ino) = fs.upsert_brain_doc(brain_path, &content) {
+            let remote_ms = parse_iso8601_ms(&doc.updated_at).ok();
+            let now = now_ms();
+            fs.db().set_mirrored_state(ino, remote_ms, Some("ok"), Some(now));
+            fs.db().set_dirty_since(ino, None);
+        }
+        reconciled += 1;
+        if doc.updated_at > newest_seen {
+            newest_seen = doc.updated_at.clone();
+        }
+        if let Some(cb) = on_progress.as_mut() {
+            cb(PullProgress {
+                page: 1,
+                total_pages: 1,
+                total_items: total,
+                reconciled,
+            });
+        }
+    }
+
+    if !newest_seen.is_empty() {
+        fs.db().sync_meta_set(SYNC_META_LAST_SEEN, &newest_seen);
+    }
+    fs.db().sync_meta_set(SYNC_META_LAST_PULL_AT, &now_ms().to_string());
+
+    Ok(reconciled)
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -67,8 +208,8 @@ async fn pull_once(api: &ApiClient, db: &Db, fs: &UnisonFs) -> anyhow::Result<()
 
         // Check if the local inode is dirty — if so, skip to avoid overwriting
         // user's in-progress edits.
-        if let Some(ino) = fs.db.ino_by_remote_path(brain_path) {
-            if let Some(dirty_since) = fs.db.get_dirty_since(ino) {
+        if let Some(ino) = db.ino_by_remote_path(brain_path) {
+            if let Some(dirty_since) = db.get_dirty_since(ino) {
                 // Parse the remote updated_at and compare
                 if let Ok(remote_ts) = parse_iso8601_ms(&doc.updated_at) {
                     if dirty_since >= remote_ts {
@@ -86,15 +227,10 @@ async fn pull_once(api: &ApiClient, db: &Db, fs: &UnisonFs) -> anyhow::Result<()
         let content = doc.body_md.as_deref().unwrap_or("").as_bytes().to_vec();
         match fs.upsert_brain_doc(brain_path, &content) {
             Ok(ino) => {
-                // Record mirrored state for this inode: the remote updated_at
-                // timestamp and an "ok" status.
                 let remote_ms = parse_iso8601_ms(&doc.updated_at).ok();
                 let now = now_ms();
-                fs.db.set_mirrored_state(ino, remote_ms, Some("ok"), Some(now));
-                // A successfully mirrored inode is no longer dirty from the
-                // pull's perspective — clear dirty_since so future pull cycles
-                // can update it again.
-                fs.db.set_dirty_since(ino, None);
+                db.set_mirrored_state(ino, remote_ms, Some("ok"), Some(now));
+                db.set_dirty_since(ino, None);
                 tracing::trace!("pull: upserted {brain_path} (ino={ino})");
             }
             Err(e) => {
@@ -103,8 +239,6 @@ async fn pull_once(api: &ApiClient, db: &Db, fs: &UnisonFs) -> anyhow::Result<()
         }
     }
 
-    // Persist the timestamp of this completed pull so incremental logic or
-    // diagnostics can use it.
     db.sync_meta_set(SYNC_META_LAST_PULL_AT, &now_ms().to_string());
 
     Ok(())

@@ -4,14 +4,19 @@ use anyhow::Result;
 use clap::Subcommand;
 
 pub mod auth;
+pub mod daemon_inner;
+pub mod daemon_runtime;
 pub mod grep;
 pub mod init;
+pub mod install;
 pub mod list;
 pub mod login;
 pub mod logout;
 pub mod logs;
+pub mod marker;
 pub mod mount;
 pub mod provision;
+pub mod startup;
 pub mod status;
 pub mod sync;
 pub mod unmount;
@@ -54,6 +59,20 @@ pub enum Command {
 
     /// Provision a new headless Unison account (machine-auth flow)
     Provision(provision::Args),
+
+    /// Install the unisonfs binary to ~/.local/bin
+    Install(InstallArgs),
+
+    /// [hidden] Inner daemon process (spawned by mount --daemon)
+    #[command(hide = true, name = "daemon-inner")]
+    DaemonInner(daemon_inner::DaemonConfig),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct InstallArgs {
+    /// Override the install directory (default: ~/.local/bin).
+    #[arg(long)]
+    pub dir: Option<std::path::PathBuf>,
 }
 
 pub async fn dispatch(cmd: Command) -> Result<()> {
@@ -70,5 +89,7 @@ pub async fn dispatch(cmd: Command) -> Result<()> {
         Command::Logs(args) => logs::run(args).await,
         Command::Sync(args) => sync::run(args).await,
         Command::Provision(args) => provision::run(args).await,
+        Command::Install(args) => install::run(args.dir),
+        Command::DaemonInner(config) => daemon_inner::run(config).await,
     }
 }

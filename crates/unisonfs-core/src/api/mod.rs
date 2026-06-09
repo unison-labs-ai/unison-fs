@@ -361,6 +361,26 @@ impl ApiClient {
             .await
     }
 
+    /// GET /v1/brain/profile — surface a summary of the brain as a structured profile.
+    pub async fn get_profile(&self) -> Result<ProfileResp, ApiError> {
+        self.get("/v1/brain/profile")
+            .send_with_retry()
+            .await?
+            .parse_json()
+            .await
+    }
+
+    /// POST /v1/brain/memory-paths — update which filesystem paths under this
+    /// mount produce memories. An empty slice disables memory generation.
+    pub async fn update_memory_paths(&self, paths: Vec<String>) -> Result<(), ApiError> {
+        let body = serde_json::json!({ "paths": paths });
+        self.post_write("/v1/brain/memory-paths")
+            .json(&body)
+            .send_with_retry()
+            .await
+            .map(|_| ())
+    }
+
     /// GET /v1/brain/neighbors — graph neighbors.
     pub async fn neighbors(&self, id_or_path: &str, limit: Option<u32>) -> Result<NeighborsResp, ApiError> {
         let mut params = vec![format!("idOrPath={}", urlencoding(id_or_path))];

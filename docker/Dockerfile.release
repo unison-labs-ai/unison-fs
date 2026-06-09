@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+# Minimal release image — binary only, no build toolchain.
+# Used by CI to produce the published Docker image.
+#
+# Requires the binary to already be built and passed via COPY or BuildKit:
+#
+#   DOCKER_BUILDKIT=1 docker build \
+#     --build-arg TARGETARCH=amd64 \
+#     -f docker/Dockerfile.release \
+#     -t ghcr.io/unison-labs-ai/unisonfs:latest .
+
+ARG TARGETARCH=amd64
+
+FROM debian:bookworm-slim
+
+# Runtime: FUSE + CA certs
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+        fuse3 libfuse2 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo "user_allow_other" >> /etc/fuse.conf
+
+# Expects the pre-built binary at ./unisonfs (or ./unisonfs-${TARGETARCH})
+ARG TARGETARCH
+COPY unisonfs /usr/local/bin/unisonfs
+RUN chmod +x /usr/local/bin/unisonfs
+
+RUN useradd -m -u 1000 unisonfs
+USER unisonfs
+
+ENV UNISON_TOKEN=""
+ENV UNISON_API_URL=""
+
+ENTRYPOINT ["/usr/local/bin/unisonfs"]
+CMD ["--help"]
+
+LABEL org.opencontainers.image.source="https://github.com/unison-labs-ai/unison-fs"
+LABEL org.opencontainers.image.description="unisonfs — mount your Unison brain as a local filesystem"
+LABEL org.opencontainers.image.licenses="Apache-2.0"

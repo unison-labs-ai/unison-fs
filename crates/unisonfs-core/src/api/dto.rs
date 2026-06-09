@@ -247,6 +247,23 @@ pub struct FactsResp {
     pub facts: Vec<BrainFact>,
 }
 
+/// GET /v1/brain/profile — summary of the user's brain contents.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileResp {
+    pub profile: BrainProfile,
+}
+
+/// Nested profile data.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrainProfile {
+    /// Long-lived core facts about the user.
+    pub static_memories: Option<Vec<String>>,
+    /// Recent contextual signals.
+    pub dynamic: Option<Vec<String>>,
+}
+
 /// POST /v1/brain/facts
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

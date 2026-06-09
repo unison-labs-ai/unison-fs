@@ -3,10 +3,10 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use crate::api::{ApiClient, ApiError, PutDocReq};
-use crate::cache::{Db, PushOp};
+use crate::cache::{Db, PushOp, UnisonFs};
 
 /// Maximum retries before poisoning a push job.
 const MAX_ATTEMPTS: i64 = 10;
@@ -15,7 +15,7 @@ const BASE_BACKOFF_MS: i64 = 500;
 /// sync_meta key for the last successful push timestamp.
 const SYNC_META_LAST_PUSH_AT: &str = "last_push_at";
 
-/// Run the push loop until `shutdown` is notified.
+/// Run the push loop until `shutdown` is notified (legacy Notify-based API).
 pub async fn run(
     api: Arc<ApiClient>,
     db: Arc<Db>,
@@ -23,7 +23,6 @@ pub async fn run(
     shutdown: Arc<Notify>,
 ) {
     loop {
-        // Wait for a push notification or shutdown.
         tokio::select! {
             _ = push_notify.notified() => {}
             _ = shutdown.notified() => {
@@ -31,6 +30,31 @@ pub async fn run(
                 drain_remaining(&api, &db).await;
                 return;
             }
+        }
+
+        drain_available(&api, &db).await;
+    }
+}
+
+/// Push worker that integrates with the `watch`-based shutdown used by
+/// [`crate::sync::SyncEngine::start`].
+pub async fn run_push_worker(fs: Arc<UnisonFs>, mut shutdown: watch::Receiver<bool>) {
+    let Some(api) = fs.api().cloned() else {
+        return;
+    };
+    let db = fs.db().clone();
+    let push_notify = db.push_notify();
+
+    loop {
+        tokio::select! {
+            _ = push_notify.notified() => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    drain_remaining(&api, &db).await;
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
         }
 
         drain_available(&api, &db).await;
