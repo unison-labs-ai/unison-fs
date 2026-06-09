@@ -14,16 +14,21 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr as FuserAttr, FileHandle, FileType as FuserFileType,
-    Filesystem, FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request, SessionACL, WriteFlags,
+    Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner,
+    MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, SessionACL, WriteFlags,
 };
 
 #[cfg(target_os = "linux")]
 use crate::vfs::{traits::FileSystem, FileType, Timestamp};
 
+/// Attribute cache TTL.
+///
+/// We use a long TTL because the daemon is the only writer — there is no
+/// outside process that can change the namespace without going through us, so
+/// cached dentries and attributes never go stale on their own.
 #[cfg(target_os = "linux")]
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 
 #[cfg(target_os = "linux")]
 fn to_fuser_type(ft: FileType) -> FuserFileType {
@@ -130,6 +135,28 @@ impl FuseAdapter {
 
 #[cfg(target_os = "linux")]
 impl Filesystem for FuseAdapter {
+    // ── Lifecycle ─────────────────────────────────────────────────────────
+
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Enable writeback caching and async reads. FUSE_NO_OPENDIR_SUPPORT
+        // tells the kernel we don't track directory handles (opendir/releasedir
+        // are no-ops), which reduces round-trips for ls/readdir.
+        let _ = config.add_capabilities(
+            InitFlags::FUSE_ASYNC_READ
+                | InitFlags::FUSE_WRITEBACK_CACHE
+                | InitFlags::FUSE_PARALLEL_DIROPS
+                | InitFlags::FUSE_CACHE_SYMLINKS
+                | InitFlags::FUSE_NO_OPENDIR_SUPPORT,
+        );
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        self.open_files.lock().clear();
+    }
+
+    // ── Name resolution + metadata ────────────────────────────────────────
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy().to_string();
         let fs = self.fs.clone();
@@ -140,6 +167,10 @@ impl Filesystem for FuseAdapter {
         }
     }
 
+    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {
+        // No-op: we don't reference-count kernel inode lookups.
+    }
+
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.rt.block_on(self.fs.getattr(ino.0)) {
             Ok(Some(attr)) => reply.attr(&TTL, &to_fuser_attr(&attr)),
@@ -148,257 +179,7 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
-        match self.rt.block_on(self.fs.readdir_plus(ino.0)) {
-            Ok(Some(entries)) => {
-                // offset 0 = start; . and .. are synthetic
-                if offset == 0 && reply.add(ino, 1, FuserFileType::Directory, ".") {
-                    reply.ok();
-                    return;
-                }
-                let base = if offset <= 1 { 0 } else { offset as usize - 2 };
-                if offset <= 1 {
-                    let parent_ino = ino; // parent unknown, use ino
-                    if offset == 0 {
-                        let _ = reply.add(ino, 1, FuserFileType::Directory, ".");
-                    }
-                    let _ = reply.add(parent_ino, 2, FuserFileType::Directory, "..");
-                }
-                for (i, entry) in entries.iter().enumerate().skip(base) {
-                    let fuse_type = to_fuser_type(entry.attr.file_type());
-                    let done = reply.add(
-                        INodeNo(entry.attr.ino),
-                        (i + 3) as u64,
-                        fuse_type,
-                        &entry.name,
-                    );
-                    if done {
-                        break;
-                    }
-                }
-                reply.ok();
-            }
-            Ok(None) => reply.error(Errno::ENOTDIR),
-            Err(e) => reply.error(to_errno(&e)),
-        }
-    }
-
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        match self.rt.block_on(self.fs.open(ino.0, flags.0)) {
-            Ok(file) => {
-                let fh = self.alloc_fh(file);
-                reply.opened(FileHandle(fh), FopenFlags::empty());
-            }
-            Err(e) => reply.error(to_errno(&e)),
-        }
-    }
-
-    fn read(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        offset: u64,
-        size: u32,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyData,
-    ) {
-        if let Some(file) = self.get_file(fh.0) {
-            match self.rt.block_on(file.read(offset, size as usize)) {
-                Ok(data) => reply.data(&data),
-                Err(e) => reply.error(to_errno(&e)),
-            }
-        } else {
-            reply.error(Errno::EBADF);
-        }
-    }
-
-    fn write(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        offset: u64,
-        data: &[u8],
-        _write_flags: WriteFlags,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyWrite,
-    ) {
-        if let Some(file) = self.get_file(fh.0) {
-            match self.rt.block_on(file.write(offset, data)) {
-                Ok(written) => reply.written(written),
-                Err(e) => reply.error(to_errno(&e)),
-            }
-        } else {
-            reply.error(Errno::EBADF);
-        }
-    }
-
-    fn release(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
-        if let Some(file) = self.get_file(fh.0) {
-            let _ = self.rt.block_on(file.flush());
-        }
-        self.release_fh(fh.0);
-        reply.ok();
-    }
-
-    fn flush(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _lock_owner: LockOwner,
-        reply: ReplyEmpty,
-    ) {
-        if let Some(file) = self.get_file(fh.0) {
-            match self.rt.block_on(file.flush()) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(to_errno(&e)),
-            }
-        } else {
-            reply.ok();
-        }
-    }
-
-    fn fsync(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
-        if let Some(file) = self.get_file(fh.0) {
-            match self.rt.block_on(file.fsync()) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(to_errno(&e)),
-            }
-        } else {
-            reply.ok();
-        }
-    }
-
-    fn mkdir(
-        &self,
-        req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        let name = name.to_string_lossy().to_string();
-        match self
-            .rt
-            .block_on(self.fs.mkdir(parent.0, &name, mode, req.uid(), req.gid()))
-        {
-            Ok(attr) => reply.entry(&TTL, &to_fuser_attr(&attr), Generation(0)),
-            Err(e) => reply.error(to_errno(&e)),
-        }
-    }
-
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_string_lossy().to_string();
-        match self.rt.block_on(self.fs.rmdir(parent.0, &name)) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_errno(&e)),
-        }
-    }
-
-    fn create(
-        &self,
-        req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        mode: u32,
-        _umask: u32,
-        flags: i32,
-        reply: ReplyCreate,
-    ) {
-        let name = name.to_string_lossy().to_string();
-        match self
-            .rt
-            .block_on(self.fs.create_file(parent.0, &name, mode, req.uid(), req.gid()))
-        {
-            Ok((attr, file)) => {
-                let fh = self.alloc_fh(file);
-                reply.created(
-                    &TTL,
-                    &to_fuser_attr(&attr),
-                    Generation(0),
-                    FileHandle(fh),
-                    FopenFlags::from_bits_retain(flags as u32),
-                );
-            }
-            Err(e) => reply.error(to_errno(&e)),
-        }
-    }
-
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_string_lossy().to_string();
-        match self.rt.block_on(self.fs.unlink(parent.0, &name)) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_errno(&e)),
-        }
-    }
-
-    fn rename(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        new_parent: INodeNo,
-        new_name: &OsStr,
-        _flags: RenameFlags,
-        reply: ReplyEmpty,
-    ) {
-        let name = name.to_string_lossy().to_string();
-        let new_name = new_name.to_string_lossy().to_string();
-        match self
-            .rt
-            .block_on(self.fs.rename(parent.0, &name, new_parent.0, &new_name))
-        {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_errno(&e)),
-        }
-    }
-
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        match self.rt.block_on(self.fs.statfs()) {
-            Ok(stats) => {
-                reply.statfs(
-                    u64::MAX / 512,          // total blocks
-                    u64::MAX / 512,          // free blocks
-                    u64::MAX / 512,          // available blocks
-                    stats.inodes,            // total inodes
-                    u64::MAX - stats.inodes, // free inodes
-                    512,                     // block size
-                    255,                     // max name len
-                    0,                       // fragment size
-                );
-            }
-            Err(e) => reply.error(to_errno(&e)),
-        }
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
         _req: &Request,
@@ -442,6 +223,358 @@ impl Filesystem for FuseAdapter {
             Ok(attr) => reply.attr(&TTL, &to_fuser_attr(&attr)),
             Err(e) => reply.error(to_errno(&e)),
         }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let fs = self.fs.clone();
+        match self.rt.block_on(async move { fs.readlink(ino.0).await }) {
+            Ok(Some(target)) => reply.data(target.as_bytes()),
+            Ok(None) => reply.error(Errno::ENOENT),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    // ── Directory operations ──────────────────────────────────────────────
+
+    fn mkdir(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = name.to_string_lossy().to_string();
+        match self
+            .rt
+            .block_on(self.fs.mkdir(parent.0, &name, mode, req.uid(), req.gid()))
+        {
+            Ok(attr) => reply.entry(&TTL, &to_fuser_attr(&attr), Generation(0)),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_string_lossy().to_string();
+        match self.rt.block_on(self.fs.rmdir(parent.0, &name)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        // FUSE_NO_OPENDIR_SUPPORT is requested in init(); some older kernels
+        // still call opendir. Return fh=0 with no flags — we don't track dir handles.
+        reply.opened(FileHandle(0), FopenFlags::empty());
+    }
+
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        let fs = self.fs.clone();
+        let entries = match self.rt.block_on(async move { fs.readdir_plus(ino.0).await }) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+            Err(e) => {
+                reply.error(to_errno(&e));
+                return;
+            }
+        };
+
+        // FUSE readdir is offset-based. `offset` is the cursor the kernel
+        // wants us to resume from; we return entries starting at that position.
+        // `reply.add` returns `true` when the reply buffer is full.
+        for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
+            let next_offset = (i + 1) as u64;
+            let full = reply.add(
+                INodeNo(entry.attr.ino),
+                next_offset,
+                to_fuser_type(entry.attr.file_type()),
+                &entry.name,
+            );
+            if full {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    // ── File operations (handle-based) ────────────────────────────────────
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        match self.rt.block_on(self.fs.open(ino.0, flags.0)) {
+            Ok(file) => {
+                let fh = self.alloc_fh(file);
+                reply.opened(FileHandle(fh), FopenFlags::empty());
+            }
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let name = name.to_string_lossy().to_string();
+        match self
+            .rt
+            .block_on(self.fs.create_file(parent.0, &name, mode, req.uid(), req.gid()))
+        {
+            Ok((attr, file)) => {
+                let fh = self.alloc_fh(file);
+                reply.created(
+                    &TTL,
+                    &to_fuser_attr(&attr),
+                    Generation(0),
+                    FileHandle(fh),
+                    FopenFlags::from_bits_retain(flags as u32),
+                );
+            }
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyData,
+    ) {
+        if let Some(file) = self.get_file(fh.0) {
+            match self.rt.block_on(file.read(offset, size as usize)) {
+                Ok(data) => reply.data(&data),
+                Err(e) => reply.error(to_errno(&e)),
+            }
+        } else {
+            reply.error(Errno::EBADF);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        if let Some(file) = self.get_file(fh.0) {
+            match self.rt.block_on(file.write(offset, data)) {
+                Ok(written) => reply.written(written),
+                Err(e) => reply.error(to_errno(&e)),
+            }
+        } else {
+            reply.error(Errno::EBADF);
+        }
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        let Some(file) = self.get_file(fh.0) else {
+            reply.ok();
+            return;
+        };
+        match self.rt.block_on(file.flush()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if let Some(file) = self.get_file(fh.0) {
+            let _ = self.rt.block_on(file.flush());
+        }
+        self.release_fh(fh.0);
+        reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let Some(file) = self.get_file(fh.0) else {
+            reply.ok();
+            return;
+        };
+        match self.rt.block_on(file.fsync()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    // ── Remove + rename ──────────────────────────────────────────────────
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_string_lossy().to_string();
+        match self.rt.block_on(self.fs.unlink(parent.0, &name)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        new_parent: INodeNo,
+        new_name: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let name = name.to_string_lossy().to_string();
+        let new_name = new_name.to_string_lossy().to_string();
+        match self
+            .rt
+            .block_on(self.fs.rename(parent.0, &name, new_parent.0, &new_name))
+        {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    // ── Symbolic + hard links ────────────────────────────────────────────
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let Some(name_str) = link_name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let Some(target_str) = target.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let name_owned = name_str.to_string();
+        let target_owned = target_str.to_string();
+        let fs = self.fs.clone();
+        let uid = req.uid();
+        let gid = req.gid();
+        match self.rt.block_on(async move {
+            fs.symlink(parent.0, &name_owned, &target_owned, uid, gid).await
+        }) {
+            Ok(attr) => reply.entry(&TTL, &to_fuser_attr(&attr), Generation(0)),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let Some(name_str) = newname.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let name_owned = name_str.to_string();
+        let fs = self.fs.clone();
+        match self.rt.block_on(async move {
+            fs.link(ino.0, newparent.0, &name_owned).await
+        }) {
+            Ok(attr) => reply.entry(&TTL, &to_fuser_attr(&attr), Generation(0)),
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    // ── Filesystem-wide ──────────────────────────────────────────────────
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        match self.rt.block_on(self.fs.statfs()) {
+            Ok(stats) => {
+                reply.statfs(
+                    stats.bytes_used / 4096, // blocks
+                    u64::MAX / 2,            // bfree
+                    u64::MAX / 2,            // bavail
+                    stats.inodes,            // files
+                    u64::MAX / 2,            // ffree
+                    4096,                    // bsize
+                    255,                     // namelen
+                    4096,                    // frsize
+                );
+            }
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    fn mknod(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        // unisonfs has no FIFOs, character devices, block devices, or sockets.
+        reply.error(Errno::ENOSYS);
     }
 }
 
