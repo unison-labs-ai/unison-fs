@@ -12,6 +12,8 @@ pub enum VfsError {
     NotDirectory,
     #[error("is a directory")]
     IsDirectory,
+    #[error("not a symbolic link")]
+    NotASymlink,
     #[error("directory not empty")]
     NotEmpty,
     #[error("invalid argument: {0}")]
@@ -20,6 +22,8 @@ pub enum VfsError {
     PermissionDenied,
     #[error("name too long")]
     NameTooLong,
+    #[error("operation not supported")]
+    NotSupported,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
@@ -29,17 +33,19 @@ pub enum VfsError {
 }
 
 impl VfsError {
-    /// Convert to a POSIX errno value for FUSE responses.
+    /// Convert to a POSIX errno value for FUSE/NFS responses.
     pub fn to_errno(&self) -> i32 {
         match self {
             VfsError::NotFound => libc::ENOENT,
             VfsError::AlreadyExists => libc::EEXIST,
             VfsError::NotDirectory => libc::ENOTDIR,
             VfsError::IsDirectory => libc::EISDIR,
+            VfsError::NotASymlink => libc::EINVAL,
             VfsError::NotEmpty => libc::ENOTEMPTY,
             VfsError::InvalidArgument(_) => libc::EINVAL,
             VfsError::PermissionDenied => libc::EACCES,
             VfsError::NameTooLong => libc::ENAMETOOLONG,
+            VfsError::NotSupported => libc::ENOSYS,
             VfsError::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
             VfsError::Database(_) => libc::EIO,
             VfsError::Other(_) => libc::EIO,

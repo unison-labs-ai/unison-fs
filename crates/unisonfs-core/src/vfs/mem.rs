@@ -362,11 +362,13 @@ impl FileSystem for MemFs {
 
     async fn readlink(&self, ino: u64) -> VfsResult<Option<String>> {
         let state = self.inner.lock();
-        let inode = state.inodes.get(&ino);
-        let Some(inode) = inode else {
+        let Some(inode) = state.inodes.get(&ino) else {
             return Ok(None);
         };
-        Ok(inode.target.clone())
+        match &inode.target {
+            Some(t) => Ok(Some(t.clone())),
+            None => Err(VfsError::NotASymlink),
+        }
     }
 
     async fn symlink(
