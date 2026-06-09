@@ -165,7 +165,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         MountBackend::Fuse => {
             let mp = mount_path.clone();
             let join = tokio::task::spawn_blocking(move || {
-                unisonfs_core::mount::fuse::mount(fs_dyn, &mp, rt)
+                unisonfs_core::mount::fuse::mount(fs_dyn, &mp)
             });
             // Write marker after mount is ready
             let _ = std::fs::write(&marker_path, &marker_text);
