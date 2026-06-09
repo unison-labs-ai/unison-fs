@@ -595,7 +595,6 @@ pub fn mount(
     config.mount_options = vec![
         MountOption::FSName("unisonfs".to_string()),
         MountOption::AutoUnmount,
-        MountOption::DefaultPermissions,
     ];
     config.acl = SessionACL::RootAndOwner;
     let adapter = FuseAdapter::new(fs);
