@@ -442,6 +442,50 @@ impl Db {
         out
     }
 
+    /// Walk the dentry tree upward from `ino` to reconstruct its absolute path.
+    /// Returns `None` if the inode is orphaned (not reachable from root) or if
+    /// it is the root itself.  The returned path starts with `/`.
+    pub(crate) fn build_path_for_ino(&self, ino: u64) -> Option<String> {
+        if ino == ROOT_INO {
+            return None;
+        }
+        let mut components: Vec<String> = Vec::new();
+        let mut cur = ino;
+        for _ in 0..64 {
+            // Guard against cycles
+            let conn = self.conn.lock();
+            let row: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT parent_ino, name FROM fs_dentry WHERE ino = ?1",
+                    [cur as i64],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .ok();
+            drop(conn);
+            let (parent, name) = row?;
+            components.push(name);
+            if parent as u64 == ROOT_INO {
+                break;
+            }
+            cur = parent as u64;
+        }
+        if components.is_empty() {
+            return None;
+        }
+        components.reverse();
+        let joined = components.join("/");
+        // The mount tree IS the brain tree. Paths already under a writable root
+        // (/private, /teams, /tenant) pass through; bare paths default to private notes.
+        let path = if joined == "private" || joined == "teams" || joined == "tenant"
+            || joined.starts_with("private/") || joined.starts_with("teams/") || joined.starts_with("tenant/")
+        {
+            format!("/{joined}")
+        } else {
+            format!("/private/notes/{joined}")
+        };
+        Some(path)
+    }
+
     pub(crate) fn row_to_attr(row: &rusqlite::Row) -> rusqlite::Result<FileAttr> {
         let ino: i64 = row.get("ino")?;
         let mode: i64 = row.get("mode")?;

@@ -88,98 +88,107 @@ impl File for DbFile {
         let last_byte = offset as usize + data.len() - 1;
         let last_chunk = last_byte / chunk_size;
 
-        let conn = self.db.conn.lock();
+        // All SQLite work runs inside this block so that the conn lock guard
+        // AND any Statement borrows are both dropped before we call
+        // set_dirty_since (which also acquires conn.lock()).
+        // parking_lot::Mutex is NOT reentrant -- holding the lock across a
+        // second lock() call deadlocks the thread.
+        {
+            let conn = self.db.conn.lock();
 
-        // Fetch all affected chunks to merge
-        let mut chunks: std::collections::HashMap<usize, Vec<u8>> = std::collections::HashMap::new();
-        let mut stmt = conn
-            .prepare(
-                "SELECT chunk_index, data FROM fs_data WHERE ino = ?1 AND chunk_index >= ?2 AND chunk_index <= ?3",
-            )
-            .map_err(VfsError::Database)?;
+            // Fetch all affected chunks to merge
+            let mut chunks: std::collections::HashMap<usize, Vec<u8>> = std::collections::HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT chunk_index, data FROM fs_data WHERE ino = ?1 AND chunk_index >= ?2 AND chunk_index <= ?3",
+                    )
+                    .map_err(VfsError::Database)?;
 
-        let rows = stmt
-            .query_map(
-                rusqlite::params![self.ino as i64, first_chunk as i64, last_chunk as i64],
-                |r| {
-                    let idx: i64 = r.get(0)?;
-                    let d: Vec<u8> = r.get(1)?;
-                    Ok((idx as usize, d))
-                },
-            )
-            .map_err(VfsError::Database)?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![self.ino as i64, first_chunk as i64, last_chunk as i64],
+                        |r| {
+                            let idx: i64 = r.get(0)?;
+                            let d: Vec<u8> = r.get(1)?;
+                            Ok((idx as usize, d))
+                        },
+                    )
+                    .map_err(VfsError::Database)?;
 
-        for row in rows {
-            let (idx, d) = row.map_err(VfsError::Database)?;
-            chunks.insert(idx, d);
-        }
+                for row in rows {
+                    let (idx, d) = row.map_err(VfsError::Database)?;
+                    chunks.insert(idx, d);
+                }
+            } // stmt + rows drop here
 
-        // Get current file size for extending
-        let current_size: i64 = conn
-            .query_row(
-                "SELECT size FROM fs_inode WHERE ino = ?1",
-                [self.ino as i64],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+            // Get current file size for extending
+            let current_size: i64 = conn
+                .query_row(
+                    "SELECT size FROM fs_inode WHERE ino = ?1",
+                    [self.ino as i64],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
 
-        // Merge data into affected chunks
-        for chunk_idx in first_chunk..=last_chunk {
-            let chunk_start = chunk_idx * chunk_size;
-            let chunk = chunks.entry(chunk_idx).or_default();
-            if chunk.len() < chunk_size {
-                // Extend if this chunk was shorter (at end of file)
-                let needed = if chunk_idx == last_chunk {
-                    ((last_byte % chunk_size) + 1).min(chunk_size)
-                } else {
-                    chunk_size
-                };
-                if chunk.len() < needed {
-                    chunk.resize(needed, 0);
+            // Merge data into affected chunks
+            for chunk_idx in first_chunk..=last_chunk {
+                let chunk_start = chunk_idx * chunk_size;
+                let chunk = chunks.entry(chunk_idx).or_default();
+                if chunk.len() < chunk_size {
+                    // Extend if this chunk was shorter (at end of file)
+                    let needed = if chunk_idx == last_chunk {
+                        ((last_byte % chunk_size) + 1).min(chunk_size)
+                    } else {
+                        chunk_size
+                    };
+                    if chunk.len() < needed {
+                        chunk.resize(needed, 0);
+                    }
+                }
+
+                let write_start = (offset as usize).saturating_sub(chunk_start);
+                let data_start = chunk_start.saturating_sub(offset as usize);
+                let write_end = ((chunk_idx + 1) * chunk_size - chunk_start)
+                    .min(data.len() - data_start + write_start)
+                    .min(chunk_size);
+
+                if write_start <= write_end && data_start < data.len() {
+                    let to_write = write_end - write_start;
+                    let to_write = to_write.min(data.len() - data_start);
+                    if chunk.len() < write_start + to_write {
+                        chunk.resize(write_start + to_write, 0);
+                    }
+                    chunk[write_start..write_start + to_write]
+                        .copy_from_slice(&data[data_start..data_start + to_write]);
                 }
             }
 
-            let write_start = (offset as usize).saturating_sub(chunk_start);
-            let data_start = chunk_start.saturating_sub(offset as usize);
-            let write_end = ((chunk_idx + 1) * chunk_size - chunk_start)
-                .min(data.len() - data_start + write_start)
-                .min(chunk_size);
+            // Write chunks back
+            let new_size = (offset as usize + data.len()).max(current_size as usize) as i64;
 
-            if write_start <= write_end && data_start < data.len() {
-                let to_write = write_end - write_start;
-                let to_write = to_write.min(data.len() - data_start);
-                if chunk.len() < write_start + to_write {
-                    chunk.resize(write_start + to_write, 0);
-                }
-                chunk[write_start..write_start + to_write]
-                    .copy_from_slice(&data[data_start..data_start + to_write]);
+            for (idx, chunk_data) in &chunks {
+                conn.execute(
+                    "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![self.ino as i64, *idx as i64, chunk_data],
+                )
+                .map_err(VfsError::Database)?;
             }
-        }
 
-        // Write chunks back
-        let new_size = (offset as usize + data.len()).max(current_size as usize) as i64;
-
-        for (idx, chunk_data) in &chunks {
+            let now = Timestamp::now();
             conn.execute(
-                "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?1, ?2, ?3)",
-                rusqlite::params![self.ino as i64, *idx as i64, chunk_data],
+                "UPDATE fs_inode SET size = ?2, mtime = ?3, ctime = ?4, mtime_nsec = ?5, ctime_nsec = ?6 WHERE ino = ?1",
+                rusqlite::params![
+                    self.ino as i64,
+                    new_size,
+                    now.sec,
+                    now.sec,
+                    now.nsec,
+                    now.nsec,
+                ],
             )
             .map_err(VfsError::Database)?;
-        }
-
-        let now = Timestamp::now();
-        conn.execute(
-            "UPDATE fs_inode SET size = ?2, mtime = ?3, ctime = ?4, mtime_nsec = ?5, ctime_nsec = ?6 WHERE ino = ?1",
-            rusqlite::params![
-                self.ino as i64,
-                new_size,
-                now.sec,
-                now.sec,
-                now.nsec,
-                now.nsec,
-            ],
-        )
-        .map_err(VfsError::Database)?;
+        } // conn lock guard drops here -- BEFORE set_dirty_since acquires it
 
         // Stamp dirty_since so the pull loop won't overwrite an inode that has
         // in-progress local edits before they are pushed.
@@ -246,6 +255,29 @@ impl File for DbFile {
     }
 
     async fn flush(&self) -> VfsResult<()> {
+        // Enqueue a push to the brain for this inode if it has a registered
+        // remote path.  This is the trigger that causes local FUSE writes to
+        // propagate to the server: FUSE calls flush() when the last fd on a
+        // file is closed (and on every close(2) in writeback-cache mode).
+        //
+        // For newly-created files that have no remote path yet, derive the
+        // brain path from the dentry tree, register it, then enqueue.
+        let brain_path = match self.db.get_remote_path(self.ino) {
+            Some(p) => Some(p),
+            None => {
+                if let Some(derived) = self.db.build_path_for_ino(self.ino) {
+                    self.db.set_remote_path(self.ino, &derived);
+                    Some(derived)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(brain_path) = brain_path {
+            let now_ms = now_ms();
+            self.db.set_dirty_since(self.ino, Some(now_ms));
+            self.db.push_queue_upsert(&brain_path, crate::cache::db::PushOp::Write, Some(self.ino), None, now_ms);
+        }
         Ok(())
     }
 
