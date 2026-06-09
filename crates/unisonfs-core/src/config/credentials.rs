@@ -111,6 +111,81 @@ pub fn resolve(explicit_token: Option<&str>) -> Option<Credentials> {
     load_global()
 }
 
+/// Encode an absolute path into a safe filename component.
+/// Replaces `/` and `:` with `__`, keeping ASCII alnum + `-_`.
+pub fn encode_path(path: &str) -> String {
+    path.chars()
+        .map(|c| match c {
+            '/' | ':' => '_',
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '.' => c,
+            _ => '_',
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn projects_dir() -> PathBuf {
+    directories::ProjectDirs::from("ai", "unisonlabs", "unisonfs")
+        .map(|d| d.config_dir().join("projects"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/unisonfs-config/projects"))
+}
+
+fn project_path(mount_path: &str) -> PathBuf {
+    projects_dir().join(format!("{}.json", encode_path(mount_path)))
+}
+
+/// Save project-scoped credentials for `mount_path`.
+pub fn save_project(mount_path: &str, creds: &Credentials) -> Result<()> {
+    write_json(&project_path(mount_path), creds)
+}
+
+/// Load project-scoped credentials for `mount_path`.
+pub fn load_project(mount_path: &str) -> Option<Credentials> {
+    load_json(&project_path(mount_path))
+}
+
+/// Remove project-scoped credentials for `mount_path`.
+pub fn remove_project(mount_path: &str) -> Result<()> {
+    match std::fs::remove_file(project_path(mount_path)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Resolve credentials with project scope taking precedence over global:
+/// explicit --token > UNISON_TOKEN env > project-scoped file > global file.
+pub fn resolve_with_project(explicit_token: Option<&str>, mount_path: Option<&str>) -> Option<Credentials> {
+    // 1. Explicit --token flag
+    if let Some(t) = explicit_token {
+        if !t.is_empty() {
+            return Some(Credentials {
+                token: t.to_string(),
+                api_url: None,
+            });
+        }
+    }
+
+    // 2. UNISON_TOKEN env var
+    if let Ok(t) = std::env::var("UNISON_TOKEN") {
+        if !t.is_empty() {
+            let api_url = std::env::var("UNISON_API_URL").ok();
+            return Some(Credentials { token: t, api_url });
+        }
+    }
+
+    // 3. Project-scoped credentials
+    if let Some(p) = mount_path {
+        if let Some(c) = load_project(p) {
+            return Some(c);
+        }
+    }
+
+    // 4. Global credentials
+    load_global()
+}
+
 /// Resolve just the API URL with proper precedence:
 /// explicit arg > UNISON_API_URL env > config file > default.
 pub fn resolve_api_url(explicit: Option<&str>) -> String {

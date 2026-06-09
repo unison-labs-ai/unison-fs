@@ -5,9 +5,11 @@
 //! exposes the brain namespace (/private/..., /tenant/..., /teams/<slug>/...,
 //! /system/search/...) as a real directory tree.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lru::LruCache;
 use parking_lot::Mutex;
 
 use crate::vfs::{
@@ -17,18 +19,25 @@ use crate::vfs::{
     mode::{DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_NAME_LEN, S_IFMT},
 };
 
-use super::db::{Db, PushOp, ROOT_INO};
+use super::db::{Db, PushOp, ROOT_INO, DENTRY_CACHE_MAX};
 use super::file::DbFile;
+use super::hydration::HydrationScheduler;
+use super::profile::{ProfileFile, PROFILE_INO, PROFILE_NAME};
 
 /// SQLite-backed filesystem that fronts the Unison brain.
 pub struct UnisonFs {
     pub(crate) db: Arc<Db>,
+    /// Optional API client; `None` in offline / test mode.
+    api: Option<Arc<crate::api::ApiClient>>,
+    /// Virtual profile.md backed by GET /v1/brain/profile.
+    profile_file: Option<Arc<ProfileFile>>,
+    /// LRU dentry cache to avoid hitting SQLite on every lookup.
+    dentry_cache: Mutex<LruCache<(u64, String), u64>>,
+    /// Background read-side hydration queue.
+    hydration: Arc<HydrationScheduler>,
     /// Owning UID/GID for new inodes (from the process at mount time).
     uid: u32,
     gid: u32,
-    /// Shared mutex around the brain_path mapping so push_queue upserts are
-    /// serialized with dentry creation.
-    _write_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for UnisonFs {
@@ -41,16 +50,171 @@ impl std::fmt::Debug for UnisonFs {
 }
 
 impl UnisonFs {
+    /// Create an offline `UnisonFs` (no API client).
     pub fn new(db: Arc<Db>) -> Self {
-        // Use the current process's uid/gid so files appear owned by the user.
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
+        #[allow(unsafe_code)]
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         Self {
             db,
+            api: None,
+            profile_file: None,
+            dentry_cache: Mutex::new(LruCache::new(NonZeroUsize::new(DENTRY_CACHE_MAX).unwrap())),
+            hydration: HydrationScheduler::new(),
             uid,
             gid,
-            _write_lock: Mutex::new(()),
         }
+    }
+
+    /// Create a `UnisonFs` with an API client for cloud sync and profile.
+    pub fn with_api(db: Arc<Db>, api: Arc<crate::api::ApiClient>) -> Self {
+        let profile_file = Arc::new(ProfileFile::new(api.clone()));
+        #[allow(unsafe_code)]
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        Self {
+            db,
+            api: Some(api),
+            profile_file: Some(profile_file),
+            dentry_cache: Mutex::new(LruCache::new(NonZeroUsize::new(DENTRY_CACHE_MAX).unwrap())),
+            hydration: HydrationScheduler::new(),
+            uid,
+            gid,
+        }
+    }
+
+    /// Return the optional API client (for sync workers).
+    pub fn api(&self) -> Option<&Arc<crate::api::ApiClient>> {
+        self.api.as_ref()
+    }
+
+    /// Expose the raw Db for workers that need direct SQL access.
+    pub fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
+    /// Return the hydration scheduler for the background worker.
+    pub fn hydration(&self) -> &Arc<HydrationScheduler> {
+        &self.hydration
+    }
+
+    /// Fetch fresh content from the brain API for `path` and populate cache.
+    pub async fn hydrate_path(&self, path: &str) -> VfsResult<()> {
+        let Some(api) = &self.api else {
+            return Ok(());
+        };
+        match api.get_doc(path).await {
+            Ok(doc) => {
+                let content = doc.body_md.as_deref().unwrap_or("").as_bytes().to_vec();
+                self.upsert_brain_doc(path, &content)?;
+                Ok(())
+            }
+            Err(crate::api::ApiError::NotFound) => Ok(()),
+            Err(e) => Err(VfsError::Io(std::io::Error::other(e.to_string()))),
+        }
+    }
+
+    /// Warm the profile.md cache from the API.
+    pub async fn warm_profile(&self) {
+        if let Some(pf) = &self.profile_file {
+            pf.warm().await;
+        }
+    }
+
+    /// How many entries are currently in the push queue.
+    pub fn push_queue_len(&self) -> usize {
+        self.db.push_queue_len()
+    }
+
+    /// How many remote documents are currently tracked in the local cache.
+    pub fn remote_count(&self) -> usize {
+        self.db.remote_count()
+    }
+
+    /// Resolve a local remote-id to an inode number (used by deletion scan).
+    pub fn ino_for_remote_id(&self, remote_id: &str) -> Option<u64> {
+        self.db.ino_for_remote_id(remote_id)
+    }
+
+    /// Remove a local inode that was deleted remotely.
+    /// Returns `Ok(true)` if an inode was removed, `Ok(false)` if not found.
+    pub fn apply_deletion(&self, remote_id: &str) -> anyhow::Result<bool> {
+        let ino = match self.db.ino_for_remote_id(remote_id) {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+        // Find the dentry and remove it.
+        let (parent_ino, name) = {
+            let conn = self.db.conn.lock();
+            conn.query_row(
+                "SELECT parent_ino, name FROM fs_dentry WHERE ino = ?1",
+                [ino as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+            )
+            .ok()
+            .unzip()
+        };
+        let (parent_ino, name) = match (parent_ino, name) {
+            (Some(p), Some(n)) => (p, n),
+            _ => return Ok(false),
+        };
+        {
+            let conn = self.db.conn.lock();
+            let _ = conn.execute(
+                "DELETE FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+                rusqlite::params![parent_ino as i64, name],
+            );
+            let nlink: i64 = conn
+                .query_row(
+                    "SELECT nlink FROM fs_inode WHERE ino = ?1",
+                    [ino as i64],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if nlink <= 1 {
+                let _ = conn.execute("DELETE FROM fs_inode WHERE ino = ?1", [ino as i64]);
+                let _ = conn.execute("DELETE FROM fs_data WHERE ino = ?1", [ino as i64]);
+                let _ = conn.execute("DELETE FROM fs_remote WHERE ino = ?1", [ino as i64]);
+            } else {
+                let _ = conn.execute(
+                    "UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?1",
+                    [ino as i64],
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Auto-import a pre-existing file from the mount path into the brain.
+    /// Returns `Ok(true)` if imported, `Ok(false)` if it already exists remotely.
+    pub async fn import_file(&self, rel_path: &str, contents: &[u8]) -> anyhow::Result<bool> {
+        let Some(api) = &self.api else {
+            return Ok(false);
+        };
+        // Check if already in the brain.
+        match api.get_doc(rel_path).await {
+            Ok(_) => return Ok(false),
+            Err(crate::api::ApiError::NotFound) => {}
+            Err(e) => return Err(anyhow::anyhow!("import check failed: {e}")),
+        }
+        let body = String::from_utf8_lossy(contents).into_owned();
+        api.put_doc(&crate::api::PutDocReq {
+            path: rel_path.to_string(),
+            body_md: body,
+            kind: Some("note".to_string()),
+            title: None,
+            tldr: None,
+            tags: None,
+            visibility: None,
+            expected_content_hash: None,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("import write failed: {e}"))?;
+        Ok(true)
+    }
+
+    /// Write raw bytes directly into an inode (used by rehydration after pull).
+    pub fn rehydrate_raw_bytes(&self, ino: u64, bytes: &[u8]) -> anyhow::Result<()> {
+        self.write_content_to_ino(ino, bytes)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
     /// Get the brain path (under /private/..., /tenant/..., etc.) for an inode.
@@ -81,14 +245,21 @@ impl UnisonFs {
     // ─── Low-level SQLite helpers ──────────────────────────────────────────
 
     fn lookup_ino(&self, parent_ino: u64, name: &str) -> Option<u64> {
+        let key = (parent_ino, name.to_string());
+        if let Some(&ino) = self.dentry_cache.lock().get(&key) {
+            return Some(ino);
+        }
         let conn = self.db.conn.lock();
-        conn.query_row(
+        let ino = conn.query_row(
             "SELECT ino FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
             rusqlite::params![parent_ino as i64, name],
             |r| r.get::<_, i64>(0),
         )
         .ok()
-        .map(|n| n as u64)
+        .map(|n| n as u64)?;
+        drop(conn);
+        self.dentry_cache.lock().put(key, ino);
+        Some(ino)
     }
 
     fn get_attr_by_ino(&self, ino: u64) -> Option<FileAttr> {
@@ -331,6 +502,12 @@ impl UnisonFs {
 #[async_trait]
 impl FileSystem for UnisonFs {
     async fn lookup(&self, parent_ino: u64, name: &str) -> VfsResult<Option<FileAttr>> {
+        // Serve the virtual profile.md from root.
+        if parent_ino == ROOT_INO && name == PROFILE_NAME {
+            if let Some(pf) = &self.profile_file {
+                return Ok(Some(pf.profile_attr()));
+            }
+        }
         let Some(ino) = self.lookup_ino(parent_ino, name) else {
             return Ok(None);
         };
@@ -338,6 +515,11 @@ impl FileSystem for UnisonFs {
     }
 
     async fn getattr(&self, ino: u64) -> VfsResult<Option<FileAttr>> {
+        if ino == PROFILE_INO {
+            if let Some(pf) = &self.profile_file {
+                return Ok(Some(pf.profile_attr()));
+            }
+        }
         Ok(self.get_attr_by_ino(ino))
     }
 
@@ -424,8 +606,12 @@ impl FileSystem for UnisonFs {
         if !self.is_dir(ino) {
             return Ok(None);
         }
-        let children = self.children(ino);
-        Ok(Some(children.into_iter().map(|(n, _)| n).collect()))
+        let mut names: Vec<String> = self.children(ino).into_iter().map(|(n, _)| n).collect();
+        // Inject profile.md at root.
+        if ino == ROOT_INO && self.profile_file.is_some() && !names.iter().any(|n| n == PROFILE_NAME) {
+            names.push(PROFILE_NAME.to_string());
+        }
+        Ok(Some(names))
     }
 
     async fn readdir_plus(&self, ino: u64) -> VfsResult<Option<Vec<DirEntry>>> {
@@ -433,12 +619,23 @@ impl FileSystem for UnisonFs {
             return Ok(None);
         }
         let children = self.children(ino);
-        let entries: Vec<DirEntry> = children
+        let mut entries: Vec<DirEntry> = children
             .into_iter()
             .filter_map(|(name, child_ino)| {
                 self.get_attr_by_ino(child_ino).map(|attr| DirEntry { name, attr })
             })
             .collect();
+        // Inject profile.md at root.
+        if ino == ROOT_INO {
+            if let Some(pf) = &self.profile_file {
+                if !entries.iter().any(|e| e.name == PROFILE_NAME) {
+                    entries.push(DirEntry {
+                        name: PROFILE_NAME.to_string(),
+                        attr: pf.profile_attr(),
+                    });
+                }
+            }
+        }
         Ok(Some(entries))
     }
 
@@ -480,6 +677,11 @@ impl FileSystem for UnisonFs {
     }
 
     async fn open(&self, ino: u64, _flags: i32) -> VfsResult<BoxedFile> {
+        if ino == PROFILE_INO {
+            if let Some(pf) = &self.profile_file {
+                return Ok(pf.clone());
+            }
+        }
         let attr = self.get_attr_by_ino(ino).ok_or(VfsError::NotFound)?;
         if attr.is_directory() {
             return Err(VfsError::IsDirectory);

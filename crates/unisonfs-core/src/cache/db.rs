@@ -50,6 +50,8 @@ impl Db {
             "ALTER TABLE fs_inode   ADD COLUMN derived     INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE push_queue ADD COLUMN poisoned    INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE push_queue ADD COLUMN last_status INTEGER",
+            // Remote document id (for deletion scan + inflight poller).
+            "ALTER TABLE fs_remote ADD COLUMN remote_id TEXT",
         ];
         for sql in migrations {
             if let Err(e) = conn.execute(sql, []) {
@@ -376,6 +378,39 @@ impl Db {
         })
         .map(|n| n as usize)
         .unwrap_or(0)
+    }
+
+    /// Count of rows in `fs_remote` — used to short-circuit deletion scan
+    /// when the cache has never been synced.
+    pub(crate) fn remote_count(&self) -> usize {
+        let conn = self.conn.lock();
+        conn.query_row("SELECT COUNT(*) FROM fs_remote", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|n| n as usize)
+        .unwrap_or(0)
+    }
+
+    /// Look up the inode that owns a given remote document id.
+    pub(crate) fn ino_for_remote_id(&self, remote_id: &str) -> Option<u64> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT ino FROM fs_remote WHERE remote_id = ?1",
+            [remote_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|n| n as u64)
+    }
+
+    /// Set the remote document id for an inode.
+    #[allow(dead_code)]
+    pub(crate) fn set_remote_id(&self, ino: u64, remote_id: &str) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "UPDATE fs_remote SET remote_id = ?2 WHERE ino = ?1",
+            rusqlite::params![ino as i64, remote_id],
+        );
     }
 
     pub(crate) fn read_all_content(&self, ino: u64) -> Vec<u8> {
