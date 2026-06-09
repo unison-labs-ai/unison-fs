@@ -15,6 +15,14 @@ use super::mode::{DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_NAME_LEN};
 use super::traits::{BoxedFile, File, FileSystem};
 use super::types::{DirEntry, FileAttr, FilesystemStats, SetAttr, TimeOrNow, Timestamp};
 
+/// Hidden marker file written by `mkdir` and removed by `rmdir`.
+///
+/// An empty directory holds a single `.unisonkeep` file so that the directory
+/// persists in the brain's remote storage. `readdir` and `readdir_plus` hide
+/// this name from callers; it is an implementation detail, not a user-visible
+/// entry.
+const KEEP_FILE: &str = ".unisonkeep";
+
 // ── internal allocator ──────────────────────────────────────────────────────
 
 struct Allocator(u64);
@@ -188,7 +196,11 @@ impl FileSystem for MemFs {
         let Some(children) = &inode.children else {
             return Ok(None);
         };
-        let mut names: Vec<String> = children.keys().cloned().collect();
+        let mut names: Vec<String> = children
+            .keys()
+            .filter(|n| n.as_str() != KEEP_FILE)
+            .cloned()
+            .collect();
         names.sort();
         Ok(Some(names))
     }
@@ -204,6 +216,7 @@ impl FileSystem for MemFs {
         };
         let mut entries: Vec<DirEntry> = children
             .iter()
+            .filter(|(name, _)| name.as_str() != KEEP_FILE)
             .filter_map(|(name, &child_ino)| {
                 state.inodes.get(&child_ino).map(|n| DirEntry {
                     name: name.clone(),
@@ -241,6 +254,12 @@ impl FileSystem for MemFs {
         let mut new_dir = Inode::new_dir(new_ino, uid, gid);
         new_dir.attr.mode = DEFAULT_DIR_MODE;
         let attr = new_dir.attr.clone();
+        // Write the hidden keep-marker so the empty directory is preserved
+        // in remote storage (e.g. the brain document store).
+        let keep_ino = state.alloc.next();
+        let keep_file = Inode::new_file(keep_ino, uid, gid);
+        state.inodes.insert(keep_ino, keep_file);
+        new_dir.children.as_mut().unwrap().insert(KEEP_FILE.to_string(), keep_ino);
         state.inodes.insert(new_ino, new_dir);
         let parent = state.inodes.get_mut(&parent_ino).unwrap();
         parent.children.as_mut().unwrap().insert(name.to_string(), new_ino);
@@ -255,16 +274,45 @@ impl FileSystem for MemFs {
             let children = parent.children.as_ref().ok_or(VfsError::NotDirectory)?;
             *children.get(name).ok_or(VfsError::NotFound)?
         };
-        {
+        // Remove the hidden keep-marker first so it doesn't block the empty check.
+        let keep_ino = {
             let child = state.inodes.get(&child_ino).ok_or(VfsError::NotFound)?;
             if !child.attr.is_directory() {
                 return Err(VfsError::NotDirectory);
             }
-            if let Some(ch) = &child.children {
-                if !ch.is_empty() {
-                    return Err(VfsError::NotEmpty);
-                }
+            child.children.as_ref().and_then(|ch| ch.get(KEEP_FILE)).copied()
+        };
+        if let Some(k) = keep_ino {
+            state.inodes.remove(&k);
+            state
+                .inodes
+                .get_mut(&child_ino)
+                .unwrap()
+                .children
+                .as_mut()
+                .unwrap()
+                .remove(KEEP_FILE);
+        }
+        let has_real_children = {
+            let child = state.inodes.get(&child_ino).ok_or(VfsError::NotFound)?;
+            child.children.as_ref().map_or(false, |ch| !ch.is_empty())
+        };
+        if has_real_children {
+            // Put the keep-marker back so the directory stays consistent.
+            if keep_ino.is_some() {
+                let restore_ino = state.alloc.next();
+                let restore = Inode::new_file(restore_ino, 0, 0);
+                state.inodes.insert(restore_ino, restore);
+                state
+                    .inodes
+                    .get_mut(&child_ino)
+                    .unwrap()
+                    .children
+                    .as_mut()
+                    .unwrap()
+                    .insert(KEEP_FILE.to_string(), restore_ino);
             }
+            return Err(VfsError::NotEmpty);
         }
         state.inodes.remove(&child_ino);
         let parent = state.inodes.get_mut(&parent_ino).unwrap();
@@ -547,11 +595,46 @@ impl File for MemFileHandle {
     }
 }
 
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+impl MemFs {
+    /// Create every missing directory component in `path` under root (ino=1),
+    /// then return the inode of the deepest directory.
+    ///
+    /// This is the in-process equivalent of `ensure_dirs_for_path` in the
+    /// SQLite-backed `CacheFs`.  The FUSE kernel handles path resolution on its
+    /// own (calling `mkdir` per component), so this helper is needed only when
+    /// code drives the VFS directly — e.g. tests and brain-sync hydration.
+    pub async fn mkdir_p(&self, path: &str) -> VfsResult<u64> {
+        let mut parent_ino: u64 = 1;
+        for component in path.trim_start_matches('/').split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            match self.lookup(parent_ino, component).await? {
+                Some(attr) if attr.is_directory() => {
+                    parent_ino = attr.ino;
+                }
+                Some(_) => {
+                    return Err(VfsError::NotDirectory);
+                }
+                None => {
+                    let attr = self.mkdir(parent_ino, component, DEFAULT_DIR_MODE, 0, 0).await?;
+                    parent_ino = attr.ino;
+                }
+            }
+        }
+        Ok(parent_ino)
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── baseline ──────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn root_exists_as_directory() {
@@ -588,5 +671,204 @@ mod tests {
         assert_eq!(written, 11);
         let read = handle.read(0, 11).await.unwrap();
         assert_eq!(read, b"hello world");
+    }
+
+    // ── mkdir / rmdir ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mkdir_creates_directory_visible_in_readdir() {
+        let fs = MemFs::new();
+        fs.mkdir(1, "notes", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        let names = fs.readdir(1).await.unwrap().unwrap();
+        assert!(names.contains(&"notes".to_string()));
+    }
+
+    #[tokio::test]
+    async fn mkdir_returns_directory_attr() {
+        let fs = MemFs::new();
+        let attr = fs.mkdir(1, "docs", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        assert!(attr.is_directory());
+    }
+
+    #[tokio::test]
+    async fn mkdir_duplicate_returns_already_exists() {
+        let fs = MemFs::new();
+        fs.mkdir(1, "x", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        let err = fs.mkdir(1, "x", DEFAULT_DIR_MODE, 0, 0).await.unwrap_err();
+        assert!(matches!(err, VfsError::AlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn rmdir_removes_empty_directory() {
+        let fs = MemFs::new();
+        fs.mkdir(1, "tmp", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        fs.rmdir(1, "tmp").await.unwrap();
+        let names = fs.readdir(1).await.unwrap().unwrap();
+        assert!(!names.contains(&"tmp".to_string()));
+    }
+
+    #[tokio::test]
+    async fn rmdir_non_empty_returns_not_empty() {
+        let fs = MemFs::new();
+        let dir = fs.mkdir(1, "nonempty", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        fs.create_file(dir.ino, "file.md", DEFAULT_FILE_MODE, 0, 0).await.unwrap();
+        let err = fs.rmdir(1, "nonempty").await.unwrap_err();
+        assert!(matches!(err, VfsError::NotEmpty));
+    }
+
+    // ── .unisonkeep marker ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mkdir_hides_unisonkeep_from_readdir() {
+        let fs = MemFs::new();
+        fs.mkdir(1, "empty_dir", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        let dir_attr = fs.lookup(1, "empty_dir").await.unwrap().unwrap();
+        let names = fs.readdir(dir_attr.ino).await.unwrap().unwrap();
+        assert!(
+            !names.contains(&KEEP_FILE.to_string()),
+            ".unisonkeep must not appear in readdir output"
+        );
+    }
+
+    #[tokio::test]
+    async fn mkdir_hides_unisonkeep_from_readdir_plus() {
+        let fs = MemFs::new();
+        fs.mkdir(1, "empty_dir2", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        let dir_attr = fs.lookup(1, "empty_dir2").await.unwrap().unwrap();
+        let entries = fs.readdir_plus(dir_attr.ino).await.unwrap().unwrap();
+        assert!(
+            entries.iter().all(|e| e.name != KEEP_FILE),
+            ".unisonkeep must not appear in readdir_plus output"
+        );
+    }
+
+    #[tokio::test]
+    async fn unisonkeep_persists_empty_dir_lookup() {
+        let fs = MemFs::new();
+        fs.mkdir(1, "persist", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        let dir_attr = fs.lookup(1, "persist").await.unwrap().unwrap();
+        // The hidden keep file IS reachable via lookup (needed for brain sync).
+        let keep = fs.lookup(dir_attr.ino, KEEP_FILE).await.unwrap();
+        assert!(keep.is_some(), ".unisonkeep inode must be internally accessible");
+        assert!(keep.unwrap().is_file());
+    }
+
+    #[tokio::test]
+    async fn rmdir_removes_unisonkeep_on_success() {
+        let fs = MemFs::new();
+        fs.mkdir(1, "clean", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        fs.rmdir(1, "clean").await.unwrap();
+        // Directory is gone.
+        let result = fs.lookup(1, "clean").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    // ── auto-parent via mkdir_p ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mkdir_p_creates_nested_dirs() {
+        let fs = MemFs::new();
+        let deep_ino = fs.mkdir_p("/private/notes/2024").await.unwrap();
+        let attr = fs.getattr(deep_ino).await.unwrap().unwrap();
+        assert!(attr.is_directory());
+        // Intermediate dirs are visible.
+        let names = fs.readdir(1).await.unwrap().unwrap();
+        assert!(names.contains(&"private".to_string()));
+    }
+
+    #[tokio::test]
+    async fn mkdir_p_is_idempotent() {
+        let fs = MemFs::new();
+        let ino1 = fs.mkdir_p("/a/b/c").await.unwrap();
+        let ino2 = fs.mkdir_p("/a/b/c").await.unwrap();
+        assert_eq!(ino1, ino2, "mkdir_p on existing path must return the same inode");
+    }
+
+    #[tokio::test]
+    async fn write_nested_file_after_mkdir_p() {
+        let fs = MemFs::new();
+        let parent_ino = fs.mkdir_p("/a/b").await.unwrap();
+        let (attr, handle) =
+            fs.create_file(parent_ino, "c.md", DEFAULT_FILE_MODE, 0, 0).await.unwrap();
+        assert!(attr.is_file());
+        handle.write(0, b"nested content").await.unwrap();
+        let data = handle.read(0, 14).await.unwrap();
+        assert_eq!(data, b"nested content");
+    }
+
+    // ── unlink ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unlink_removes_file() {
+        let fs = MemFs::new();
+        fs.create_file(1, "del.md", DEFAULT_FILE_MODE, 0, 0).await.unwrap();
+        fs.unlink(1, "del.md").await.unwrap();
+        assert!(fs.lookup(1, "del.md").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unlink_missing_file_returns_not_found() {
+        let fs = MemFs::new();
+        let err = fs.unlink(1, "ghost.md").await.unwrap_err();
+        assert!(matches!(err, VfsError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn unlink_directory_returns_is_directory() {
+        let fs = MemFs::new();
+        fs.mkdir(1, "adir", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        let err = fs.unlink(1, "adir").await.unwrap_err();
+        assert!(matches!(err, VfsError::IsDirectory));
+    }
+
+    // ── rename ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rename_moves_file_to_same_dir() {
+        let fs = MemFs::new();
+        fs.create_file(1, "old.md", DEFAULT_FILE_MODE, 0, 0).await.unwrap();
+        fs.rename(1, "old.md", 1, "new.md").await.unwrap();
+        assert!(fs.lookup(1, "old.md").await.unwrap().is_none());
+        assert!(fs.lookup(1, "new.md").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn rename_moves_file_across_dirs() {
+        let fs = MemFs::new();
+        let src_dir = fs.mkdir(1, "src", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        let dst_dir = fs.mkdir(1, "dst", DEFAULT_DIR_MODE, 0, 0).await.unwrap();
+        fs.create_file(src_dir.ino, "f.md", DEFAULT_FILE_MODE, 0, 0).await.unwrap();
+        fs.rename(src_dir.ino, "f.md", dst_dir.ino, "f.md").await.unwrap();
+        assert!(fs.lookup(src_dir.ino, "f.md").await.unwrap().is_none());
+        assert!(fs.lookup(dst_dir.ino, "f.md").await.unwrap().is_some());
+    }
+
+    // ── symlink / readlink ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn symlink_and_readlink_round_trip() {
+        let fs = MemFs::new();
+        let attr = fs.symlink(1, "link.md", "/private/notes/target.md", 0, 0).await.unwrap();
+        assert!(attr.is_symlink());
+        let target = fs.readlink(attr.ino).await.unwrap();
+        assert_eq!(target, Some("/private/notes/target.md".to_string()));
+    }
+
+    #[tokio::test]
+    async fn readlink_on_missing_inode_returns_none() {
+        let fs = MemFs::new();
+        let result = fs.readlink(9999).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn readlink_on_regular_file_returns_error() {
+        let fs = MemFs::new();
+        let (attr, _) = fs.create_file(1, "regular.md", DEFAULT_FILE_MODE, 0, 0).await.unwrap();
+        let err = fs.readlink(attr.ino).await.unwrap_err();
+        assert!(
+            matches!(err, VfsError::NotASymlink),
+            "readlink on a regular file must return NotASymlink"
+        );
     }
 }
