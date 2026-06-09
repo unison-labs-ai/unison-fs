@@ -64,10 +64,23 @@ fn to_errno(e: &crate::vfs::error::VfsError) -> Errno {
 }
 
 /// FUSE adapter wrapping an `Arc<dyn FileSystem>`.
+///
+/// Each handler callback runs on the thread that `fuser` uses to dispatch FUSE
+/// requests.  That thread is itself a worker of the *outer* multi-threaded
+/// tokio runtime, so calling `Handle::block_on` from inside a callback would
+/// exhaust the worker pool and deadlock (all workers park waiting for each
+/// other).
+///
+/// The fix: own a *private* `current_thread` tokio runtime.  Its event loop
+/// runs entirely on the calling thread (the fuser dispatch thread) and never
+/// competes with the outer pool, so `block_on` is always safe.
 #[cfg(target_os = "linux")]
 pub struct FuseAdapter {
     fs: Arc<dyn FileSystem + 'static>,
-    rt: tokio::runtime::Handle,
+    /// Dedicated single-threaded runtime used exclusively for bridging the
+    /// synchronous fuser callbacks to async VFS operations.  Must NOT be the
+    /// shared multi-threaded runtime — see struct-level doc comment.
+    rt: tokio::runtime::Runtime,
     /// Open file table: fh → BoxedFile
     open_files: parking_lot::Mutex<std::collections::HashMap<u64, crate::vfs::BoxedFile>>,
     next_fh: std::sync::atomic::AtomicU64,
@@ -85,7 +98,11 @@ impl std::fmt::Debug for FuseAdapter {
 
 #[cfg(target_os = "linux")]
 impl FuseAdapter {
-    pub fn new(fs: Arc<dyn FileSystem + 'static>, rt: tokio::runtime::Handle) -> Self {
+    pub fn new(fs: Arc<dyn FileSystem + 'static>) -> Self {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build FuseAdapter current_thread runtime");
         Self {
             fs,
             rt,
@@ -430,12 +447,16 @@ impl Filesystem for FuseAdapter {
 
 /// Mount the filesystem at `mount_path` using FUSE.
 ///
-/// Blocks until unmount. Call from a background thread.
+/// Blocks until unmount. Intended to be called from a `spawn_blocking` task or
+/// a dedicated OS thread — never from an `async` context directly, because
+/// `fuser::mount2` drives a synchronous event loop.
+///
+/// The `rt` parameter has been removed: `FuseAdapter` now owns its own
+/// `current_thread` runtime so it never borrows workers from the caller's pool.
 #[cfg(target_os = "linux")]
 pub fn mount(
     fs: Arc<dyn FileSystem + 'static>,
     mount_path: &Path,
-    rt: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     let mut config = Config::default();
     config.mount_options = vec![
@@ -444,7 +465,7 @@ pub fn mount(
         MountOption::DefaultPermissions,
     ];
     config.acl = SessionACL::RootAndOwner;
-    let adapter = FuseAdapter::new(fs, rt);
+    let adapter = FuseAdapter::new(fs);
     fuser::mount2(adapter, mount_path, &config)?;
     Ok(())
 }
@@ -454,7 +475,6 @@ pub fn mount(
 pub fn mount(
     _fs: std::sync::Arc<dyn crate::vfs::FileSystem>,
     _mount_path: &std::path::Path,
-    _rt: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     anyhow::bail!("FUSE backend is only supported on Linux; use --backend nfs on macOS")
 }

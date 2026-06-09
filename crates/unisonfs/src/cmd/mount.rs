@@ -243,7 +243,7 @@ async fn run_foreground(
         MountBackend::Fuse => {
             let mp = mount_path.clone();
             let join = tokio::task::spawn_blocking(move || {
-                unisonfs_core::mount::fuse::mount(fs_dyn, &mp, rt)
+                unisonfs_core::mount::fuse::mount(fs_dyn, &mp)
             });
             join.await??;
         }
