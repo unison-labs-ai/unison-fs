@@ -295,7 +295,7 @@ impl FileSystem for MemFs {
         }
         let has_real_children = {
             let child = state.inodes.get(&child_ino).ok_or(VfsError::NotFound)?;
-            child.children.as_ref().map_or(false, |ch| !ch.is_empty())
+            child.children.as_ref().is_some_and(|ch| !ch.is_empty())
         };
         if has_real_children {
             // Put the keep-marker back so the directory stays consistent.
