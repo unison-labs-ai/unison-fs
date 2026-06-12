@@ -18,7 +18,7 @@ const MAX_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 100;
 
 /// Default Unison API base URL.
-pub const DEFAULT_API_URL: &str = "https://api.unisonlabs.ai";
+pub const DEFAULT_API_URL: &str = "https://brain.unisonlabs.ai";
 
 /// Unison brain API client.
 ///
@@ -57,7 +57,7 @@ impl ApiClient {
     /// Create a new API client.
     ///
     /// `base_url` — override with `UNISON_API_URL` env var or default to
-    /// `https://api.unisonlabs.ai`.
+    /// `https://brain.unisonlabs.ai`.
     /// `token` — the `usk_live_...` key from `UNISON_TOKEN`.
     pub fn new(base_url: &str, token: &str) -> Self {
         let http = Client::builder()
