@@ -39,7 +39,7 @@ Requires Rust 1.80 or newer.
 | Variable | Description |
 |---|---|
 | `UNISON_TOKEN` | Your `usk_live_...` API token (takes precedence over config file) |
-| `UNISON_API_URL` | Override the API base URL (default: `https://api.unisonlabs.ai`) |
+| `UNISON_API_URL` | Override the API base URL (default: `https://brain.unisonlabs.ai`) |
 
 ## Quickstart
 

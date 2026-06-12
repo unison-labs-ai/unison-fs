@@ -34,7 +34,7 @@ Set `UNISON_TOKEN` to your `usk_...` API key. This overrides any stored config.
 
 ```bash
 export UNISON_TOKEN=usk_live_...
-export UNISON_API_URL=https://api.unisonlabs.ai   # optional; this is the default
+export UNISON_API_URL=https://brain.unisonlabs.ai   # optional; this is the default
 ```
 
 To store credentials interactively:
@@ -105,7 +105,7 @@ unisonfs mount ~/brain \
 | Variable | Description |
 |---|---|
 | `UNISON_TOKEN` | `usk_live_...` API key (required) |
-| `UNISON_API_URL` | Override API base URL (default: `https://api.unisonlabs.ai`) |
+| `UNISON_API_URL` | Override API base URL (default: `https://brain.unisonlabs.ai`) |
 
 ---
 
