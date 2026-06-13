@@ -25,8 +25,21 @@ pub async fn mount(
 ) -> Result<()> {
     use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
-    let listener = NFSTcpListener::bind("127.0.0.1:0", NfsAdapter::new(fs)).await?;
-    let port = listener.get_listen_port();
+    // Bind in the user/registered port range (from 11111) rather than letting
+    // the OS pick an ephemeral 49152+ port. macOS's NFS client treats the
+    // dynamic/ephemeral range differently and denies I/O to a server there;
+    // a registered-range port is what lets the mount actually serve.
+    let mut port = 0u16;
+    for candidate in 11111u16..11211 {
+        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            port = candidate;
+            break;
+        }
+    }
+    if port == 0 {
+        anyhow::bail!("no free port in 11111-11211 for the local NFS server");
+    }
+    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{port}"), NfsAdapter::new(fs)).await?;
 
     tracing::info!("NFS server listening on 127.0.0.1:{port}");
 
@@ -45,18 +58,22 @@ pub async fn mount(
     // listen backlog until handle_forever accepts it.
     let serve = tokio::spawn(async move { listener.handle_forever().await });
 
+    // Let the accept loop start polling before the mount command opens its
+    // connection (the socket is already bound, but this avoids the first RPC
+    // racing the scheduler).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     #[cfg(target_os = "macos")]
     {
-        let status = tokio::process::Command::new("mount_nfs")
+        // `locallocks` (not `nolocks`) plus `timeo`/`retrans` give the soft
+        // mount enough grace for the localhost server to answer the first I/O
+        // RPCs instead of failing them with EPERM. No `resvport` (would force
+        // sudo) and no `nfc`. Absolute path: a non-root shell may lack /sbin.
+        let status = tokio::process::Command::new("/sbin/mount_nfs")
             .args([
-                // Mirror the Linux branch: pin v3 + TCP and pass the server's
-                // port explicitly (it serves mount + nfs on the same localhost
-                // port). `soft` avoids kernel hangs if the daemon dies. No
-                // `resvport`: a loopback mount needs no reserved (<1024) source
-                // port, and requiring one forced sudo.
                 "-o",
                 &format!(
-                    "vers=3,tcp,port={port},mountport={port},soft,nolocks,locallocks,nfc"
+                    "locallocks,vers=3,tcp,port={port},mountport={port},soft,timeo=10,retrans=2"
                 ),
                 "127.0.0.1:/",
                 &*mount_path_str,
@@ -75,7 +92,9 @@ pub async fn mount(
                 "-t",
                 "nfs",
                 "-o",
-                &format!("port={port},mountport={port},proto=tcp,nfsvers=3,nolock,soft"),
+                &format!(
+                    "vers=3,tcp,port={port},mountport={port},nolock,soft,timeo=10,retrans=2"
+                ),
                 "127.0.0.1:/",
                 &*mount_path_str,
             ])
