@@ -36,6 +36,15 @@ pub async fn mount(
 
     let mount_path_str = mount_path.to_string_lossy();
 
+    // Serve BEFORE mounting. `mount_nfs` (macOS) and `mount -t nfs` (Linux)
+    // perform the MOUNT/NULL RPC handshake *during* the mount call, so the
+    // accept loop must already be running. Running it afterwards left the
+    // server unable to answer the handshake: on macOS mount_nfs returned 0 but
+    // never attached; on Linux it only worked by lazy first-access luck. The
+    // socket is already bound, so any connection mount_nfs opens queues in the
+    // listen backlog until handle_forever accepts it.
+    let serve = tokio::spawn(async move { listener.handle_forever().await });
+
     #[cfg(target_os = "macos")]
     {
         let status = tokio::process::Command::new("mount_nfs")
@@ -79,7 +88,10 @@ pub async fn mount(
 
     tracing::info!("Mounted NFS at {}", mount_path.display());
 
-    listener.handle_forever().await?;
+    // Block until the server stops (i.e. the filesystem is unmounted).
+    serve
+        .await
+        .map_err(|e| anyhow::anyhow!("nfs serve task panicked: {e}"))??;
 
     Ok(())
 }
