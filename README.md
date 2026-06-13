@@ -1,6 +1,22 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/unison-labs-ai/unison-brain/main/assets/brain.svg" width="140" alt="Unison" />
+
 # unison-fs
 
+**Mount your agent's brain as a folder. ls, cat, grep, and edit your memory.**
+
 A filesystem for AI agents — mount the [Unison brain](https://unisonlabs.ai) as a real local directory (FUSE on Linux, embedded NFS on macOS) with a local SQLite cache, background sync loop, and semantic `sgrep` command.
+
+[![CI](https://github.com/unison-labs-ai/unison-fs/actions/workflows/ci.yml/badge.svg)](https://github.com/unison-labs-ai/unison-fs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Stars](https://img.shields.io/github/stars/unison-labs-ai/unison-fs?style=social)](https://github.com/unison-labs-ai/unison-fs)
+
+[**Install**](#install) • [**Quickstart**](#quickstart) • [**Commands**](#commands) • [**Semantic search**](#semantic-search) • [**Architecture**](#architecture)
+
+</div>
+
+---
 
 Read, write, and `sgrep` the Unison brain like any local folder. Editors, scripts, and AI agents that already understand files work without any changes.
 
@@ -190,6 +206,38 @@ cargo build --release
 ./target/release/unisonfs --help
 ```
 
+## Star history
+
+If this is useful, a star helps others find it.
+
+<div align="center">
+
+[![Star History Chart](https://api.star-history.com/svg?repos=unison-labs-ai/unison-fs&type=Date)](https://star-history.com/#unison-labs-ai/unison-fs&Date)
+
+</div>
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+---
+
+## Part of the Unison Labs constellation
+
+**One brain, every agent.** Every repo below reads from _and writes to_ the same [Unison brain](https://unisonlabs.ai) — no per-tool memory silos.
+
+| Repo | What it does |
+|---|---|
+| [unison-brain](https://github.com/unison-labs-ai/unison-brain) | CLI · SDK · MCP server — the core |
+| [claude-unison](https://github.com/unison-labs-ai/claude-unison) | Memory for Claude Code |
+| [cursor-unison](https://github.com/unison-labs-ai/cursor-unison) | Memory for Cursor |
+| [codex-unison](https://github.com/unison-labs-ai/codex-unison) | Memory for OpenAI Codex CLI |
+| [opencode-unison](https://github.com/unison-labs-ai/opencode-unison) | Memory for OpenCode |
+| [openclaw-unison](https://github.com/unison-labs-ai/openclaw-unison) | Memory for OpenClaw |
+| [pipecat-unison](https://github.com/unison-labs-ai/pipecat-unison) | Memory for Pipecat voice agents |
+| [python-sdk](https://github.com/unison-labs-ai/python-sdk) | Python SDK for the brain |
+| [install-mcp](https://github.com/unison-labs-ai/install-mcp) | One-command MCP installer |
+| [code-chunk](https://github.com/unison-labs-ai/code-chunk) | AST-aware code chunking |
+| **[unison-fs](https://github.com/unison-labs-ai/unison-fs)** | **Mount the brain as a filesystem ← you are here** |
+| [backchannel](https://github.com/unison-labs-ai/backchannel) | Async messaging between agents |
+| [Unison-evals](https://github.com/unison-labs-ai/Unison-evals) | Open memory benchmark suite |
