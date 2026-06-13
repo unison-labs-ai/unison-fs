@@ -40,9 +40,16 @@ pub async fn mount(
     {
         let status = tokio::process::Command::new("mount_nfs")
             .args([
+                // Mirror the Linux branch: pin v3 + TCP and pass the server's
+                // port explicitly (it serves mount + nfs on the same localhost
+                // port). `soft` avoids kernel hangs if the daemon dies. No
+                // `resvport`: a loopback mount needs no reserved (<1024) source
+                // port, and requiring one forced sudo.
                 "-o",
-                "nolocks,locallocks,resvport,nfc",
-                &format!("127.0.0.1:{port}/"),
+                &format!(
+                    "vers=3,tcp,port={port},mountport={port},soft,nolocks,locallocks,nfc"
+                ),
+                "127.0.0.1:/",
                 &*mount_path_str,
             ])
             .status()
