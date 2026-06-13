@@ -43,8 +43,8 @@ pub async fn run(args: Args) -> Result<()> {
     match client.whoami().await {
         Ok(info) => {
             eprintln!(
-                "ok (tenant: {}, email: {})",
-                info.tenant_name, info.user_email
+                "ok (workspace: {}, email: {})",
+                info.workspace_name, info.user_email
             );
         }
         Err(unisonfs_core::api::ApiError::Auth) => {

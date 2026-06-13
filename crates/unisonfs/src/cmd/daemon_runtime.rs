@@ -2,7 +2,7 @@
 //!
 //! Sequence:
 //! 1. Open SQLite cache.
-//! 2. Verify token, identify tenant.
+//! 2. Verify token, identify workspace.
 //! 3. Write startup progress file.
 //! 4. Run initial deletion scan + full pull (with progress updates).
 //! 5. Mount filesystem (FUSE/Linux or NFS/macOS).
@@ -43,7 +43,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
 
     let api_url = resolve_api_url(None);
 
-    // --- Verify token & identify tenant ---
+    // --- Verify token & identify workspace ---
     let client = unisonfs_core::api::ApiClient::new(&api_url, &token);
     let whoami = client
         .whoami()
@@ -51,7 +51,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         .context("failed to verify Unison token")?;
 
     // --- Open SQLite cache ---
-    let db_path = unisonfs_core::config::cache_db_path_for_tag(&whoami.tenant_id, tag);
+    let db_path = unisonfs_core::config::cache_db_path_for_tag(&whoami.workspace_id, tag);
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

@@ -17,7 +17,7 @@ investigate. We will credit reporters who want it once a fix ships.
 
 This repository is the **open-source filesystem client** (Rust binary + library).
 It holds no secrets and is not itself a security boundary — authentication,
-authorization, tenant isolation, and rate limiting are enforced server-side by
+authorization, workspace isolation, and rate limiting are enforced server-side by
 the Unison brain API.
 
 Reports about the client are most useful when they concern:

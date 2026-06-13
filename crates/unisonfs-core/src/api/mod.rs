@@ -39,9 +39,9 @@ pub struct ApiClient {
 pub struct WhoamiInfo {
     pub user_id: String,
     pub user_email: String,
-    pub tenant_id: String,
-    pub tenant_name: String,
-    pub tenant_verified: bool,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub workspace_verified: bool,
     pub scopes: Vec<String>,
 }
 
@@ -86,7 +86,7 @@ impl ApiClient {
 
     // ─── Auth ──────────────────────────────────────────────────────────────
 
-    /// GET /v1/auth/whoami — verify the token and return user/tenant info.
+    /// GET /v1/auth/whoami — verify the token and return user/workspace info.
     pub async fn whoami(&self) -> Result<WhoamiInfo, ApiError> {
         let resp: serde_json::Value = self
             .get("/v1/auth/whoami")
@@ -103,15 +103,15 @@ impl ApiClient {
             .as_str()
             .unwrap_or("")
             .to_string();
-        let tenant_id = resp["tenant"]["id"]
+        let workspace_id = resp["workspace"]["id"]
             .as_str()
             .unwrap_or("")
             .to_string();
-        let tenant_name = resp["tenant"]["name"]
+        let workspace_name = resp["workspace"]["name"]
             .as_str()
             .unwrap_or("")
             .to_string();
-        let tenant_verified = resp["tenant"]["verified"].as_bool().unwrap_or(false);
+        let workspace_verified = resp["workspace"]["verified"].as_bool().unwrap_or(false);
         let scopes: Vec<String> = resp["scopes"]
             .as_array()
             .unwrap_or(&vec![])
@@ -122,9 +122,9 @@ impl ApiClient {
         Ok(WhoamiInfo {
             user_id,
             user_email,
-            tenant_id,
-            tenant_name,
-            tenant_verified,
+            workspace_id,
+            workspace_name,
+            workspace_verified,
             scopes,
         })
     }

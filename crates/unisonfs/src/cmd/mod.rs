@@ -27,7 +27,7 @@ pub enum Command {
     /// Authenticate with the Unison brain (stores UNISON_TOKEN)
     Login(login::Args),
 
-    /// Show the currently-authenticated user and tenant
+    /// Show the currently-authenticated user and workspace
     Whoami(whoami::Args),
 
     /// Mount the Unison brain at a local path

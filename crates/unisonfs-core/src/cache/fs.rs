@@ -2,7 +2,7 @@
 //!
 //! `UnisonFs` is the core VFS backend. It stores the brain's virtual tree in a
 //! local SQLite cache, routes writes to the push queue for background sync, and
-//! exposes the brain namespace (/private/..., /tenant/..., /teams/<slug>/...,
+//! exposes the brain namespace (/private/..., /workspace/..., /workspace/teams/<slug>/...,
 //! /system/search/...) as a real directory tree.
 
 use std::num::NonZeroUsize;
@@ -217,7 +217,7 @@ impl UnisonFs {
             .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
-    /// Get the brain path (under /private/..., /tenant/..., etc.) for an inode.
+    /// Get the brain path (under /private/..., /workspace/..., etc.) for an inode.
     pub fn brain_path_for_ino(&self, ino: u64) -> Option<String> {
         self.db.get_remote_path(ino)
     }
