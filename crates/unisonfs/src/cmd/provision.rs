@@ -3,7 +3,7 @@
 //! Three-step:
 //!   1. POST /v1/auth/provision → get unverified usk_ key + email OTP
 //!   2. User enters OTP
-//!   3. POST /v1/auth/verify → make tenant durable
+//!   3. POST /v1/auth/verify → make workspace durable
 //!
 //! For existing accounts use `unisonfs provision --request-key` to trigger
 //! the recovery flow, then enter the OTP.

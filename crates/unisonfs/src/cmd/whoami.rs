@@ -1,4 +1,4 @@
-//! `unisonfs whoami` — show the current user, tenant, and API endpoint.
+//! `unisonfs whoami` — show the current user, workspace, and API endpoint.
 
 use anyhow::Result;
 use clap::Args as ClapArgs;
@@ -18,10 +18,10 @@ pub async fn run(args: Args) -> Result<()> {
     let client = unisonfs_core::api::ApiClient::new(&api_url, &token);
     let info = client.whoami().await?;
 
-    println!("User:    {} ({})", info.user_email, info.user_id);
+    println!("User:      {} ({})", info.user_email, info.user_id);
     println!(
-        "Tenant:  {} ({}) [verified: {}]",
-        info.tenant_name, info.tenant_id, info.tenant_verified
+        "Workspace: {} ({}) [verified: {}]",
+        info.workspace_name, info.workspace_id, info.workspace_verified
     );
     println!("Scopes:  {}", info.scopes.join(", "));
     println!("API URL: {api_url}");

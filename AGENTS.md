@@ -61,13 +61,13 @@ The mount exposes the brain namespace as directories:
 ```
 ~/brain/
   private/           — your private notes and files
-  tenant/            — your whole tenant/org
-  teams/<slug>/      — team-scoped documents
+  workspace/         — your whole workspace/org
+    teams/<slug>/    — team-scoped documents
   system/            — read-only synthesized views
 ```
 
-All documents must end in `.md`. Writable roots: `/private/`, `/tenant/`,
-`/teams/<slug>/`. Read-only: `/system/`.
+All documents must end in `.md`. Writable roots: `/private/`, `/workspace/`.
+Read-only: `/system/`.
 
 ### 4. Use it
 

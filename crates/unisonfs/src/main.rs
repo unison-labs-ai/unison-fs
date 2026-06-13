@@ -18,7 +18,7 @@ mod cmd;
     name = "unisonfs",
     version,
     about = "Mount the Unison brain as a local filesystem",
-    long_about = "unisonfs — exposes the Unison brain (/private/..., /tenant/..., /teams/<slug>/...) \
+    long_about = "unisonfs — exposes the Unison brain (/private/..., /workspace/..., /workspace/teams/<slug>/...) \
                   as a real local directory. Reads hit the local SQLite cache, writes route through \
                   the background push queue to the brain REST API."
 )]

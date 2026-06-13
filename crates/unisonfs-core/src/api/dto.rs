@@ -13,7 +13,7 @@ pub type MetadataMap = HashMap<String, serde_json::Value>;
 #[serde(rename_all = "camelCase")]
 pub struct ProvisionResp {
     pub api_key: String,
-    pub tenant_id: String,
+    pub workspace_id: String,
     pub status: String,
     pub email_sent: bool,
     pub message: Option<String>,
@@ -24,7 +24,7 @@ pub struct ProvisionResp {
 #[serde(rename_all = "camelCase")]
 pub struct VerifyResp {
     pub verified: bool,
-    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
     /// Only present on key recovery (already-verified account).
     pub api_key: Option<String>,
 }

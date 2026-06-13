@@ -475,9 +475,9 @@ impl Db {
         components.reverse();
         let joined = components.join("/");
         // The mount tree IS the brain tree. Paths already under a writable root
-        // (/private, /teams, /tenant) pass through; bare paths default to private notes.
-        let path = if joined == "private" || joined == "teams" || joined == "tenant"
-            || joined.starts_with("private/") || joined.starts_with("teams/") || joined.starts_with("tenant/")
+        // (/private, /workspace) pass through; bare paths default to private notes.
+        let path = if joined == "private" || joined == "workspace"
+            || joined.starts_with("private/") || joined.starts_with("workspace/")
         {
             format!("/{joined}")
         } else {

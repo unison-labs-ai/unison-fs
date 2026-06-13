@@ -126,13 +126,13 @@ async fn run_foreground(
         None => MountBackend::default(),
     };
 
-    // Validate token & identify tenant
+    // Validate token & identify workspace
     let client = unisonfs_core::api::ApiClient::new(&api_url, &token);
     eprint!("Verifying token... ");
     let whoami = client.whoami().await.context("failed to verify Unison token")?;
     eprintln!(
-        "ok (tenant: {}, verified: {})",
-        whoami.tenant_name, whoami.tenant_verified
+        "ok (workspace: {}, verified: {})",
+        whoami.workspace_name, whoami.workspace_verified
     );
 
     // Open SQLite cache
@@ -140,10 +140,10 @@ async fn run_foreground(
         None
     } else {
         if args.clean {
-            let p = unisonfs_core::config::cache_db_path_for_tag(&whoami.tenant_id, &tag);
+            let p = unisonfs_core::config::cache_db_path_for_tag(&whoami.workspace_id, &tag);
             let _ = std::fs::remove_file(&p);
         }
-        let p = unisonfs_core::config::cache_db_path_for_tag(&whoami.tenant_id, &tag);
+        let p = unisonfs_core::config::cache_db_path_for_tag(&whoami.workspace_id, &tag);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }

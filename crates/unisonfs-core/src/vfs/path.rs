@@ -1,7 +1,7 @@
 //! Path normalization helpers for brain document paths.
 //!
 //! The Unison brain enforces a filesystem contract:
-//! - Writable roots: /private/..., /tenant/..., /teams/<slug>/...
+//! - Writable roots: /private/..., /workspace/..., /workspace/teams/<slug>/...
 //! - Read-only roots: /system/..., /sources/...
 //! - All paths must end in .md
 //!
@@ -17,8 +17,7 @@ pub fn normalize_brain_path(raw: &str) -> Option<String> {
 
     // Already under a writable root — pass through
     if raw.starts_with("/private/")
-        || raw.starts_with("/tenant/")
-        || raw.starts_with("/teams/")
+        || raw.starts_with("/workspace/")
         || raw.starts_with("/wiki/")
         || raw.starts_with("/skills/")
     {
@@ -56,8 +55,7 @@ fn slugify(s: &str) -> String {
 /// Return true if the path is under a writable brain root.
 pub fn is_writable_path(path: &str) -> bool {
     path.starts_with("/private/")
-        || path.starts_with("/tenant/")
-        || path.starts_with("/teams/")
+        || path.starts_with("/workspace/")
         || path.starts_with("/wiki/")
         || path.starts_with("/skills/")
 }
@@ -80,18 +78,18 @@ mod tests {
     }
 
     #[test]
-    fn tenant_path_passes_through() {
+    fn workspace_path_passes_through() {
         assert_eq!(
-            normalize_brain_path("/tenant/people/daniel.md"),
-            Some("/tenant/people/daniel.md".to_string())
+            normalize_brain_path("/workspace/people/daniel.md"),
+            Some("/workspace/people/daniel.md".to_string())
         );
     }
 
     #[test]
-    fn teams_path_passes_through() {
+    fn workspace_teams_path_passes_through() {
         assert_eq!(
-            normalize_brain_path("/teams/eng/docs/arch.md"),
-            Some("/teams/eng/docs/arch.md".to_string())
+            normalize_brain_path("/workspace/teams/eng/docs/arch.md"),
+            Some("/workspace/teams/eng/docs/arch.md".to_string())
         );
     }
 

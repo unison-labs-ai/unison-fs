@@ -8,7 +8,7 @@ Read, write, and `sgrep` the Unison brain like any local folder. Editors, script
 unisonfs login                        # store your UNISON_TOKEN
 unisonfs mount ~/brain                # mount the brain at ~/brain
 ls ~/brain/private/notes/             # browse your private notes
-cat ~/brain/tenant/people/daniel.md   # read a tenant-level doc
+cat ~/brain/workspace/people/daniel.md   # read a workspace-level doc
 echo "# My Note" > ~/brain/private/notes/idea.md  # write syncs to the brain
 sgrep "auth decisions"                # semantic search
 unisonfs unmount ~/brain              # unmount and drain the push queue
@@ -66,18 +66,18 @@ The mount exposes the Unison brain namespace as a directory tree:
 ~/brain/
   private/           — your private notes and files
     notes/           — default namespace for /private/notes/*.md
-  tenant/            — visible to your whole tenant/company
+  workspace/         — visible to your whole workspace/org
     people/
     projects/
-  teams/
-    eng/             — team-scoped documents
-    marketing/
+    teams/
+      eng/           — team-scoped documents
+      marketing/
   system/            — read-only synthesized views
     search/
       semantic/      — virtual semantic search (read any .md path here)
 ```
 
-**Writable roots:** `/private/`, `/tenant/`, `/teams/<slug>/`
+**Writable roots:** `/private/`, `/workspace/`
 
 **Read-only roots:** `/system/`
 
@@ -87,7 +87,7 @@ All documents must end in `.md`.
 
 ```
 unisonfs login                  one-time auth, stores token
-unisonfs whoami                 show current user, tenant, API endpoint
+unisonfs whoami                 show current user, workspace, API endpoint
 unisonfs mount <path>           mount the brain at <path>
 unisonfs unmount <path>         unmount and drain pending writes
 unisonfs list                   show all running mounts
@@ -123,7 +123,7 @@ Run `unisonfs init` once. After that, `sgrep` anywhere searches the brain semant
 
 ```sh
 sgrep "OAuth decisions"           # semantic: finds notes about the topic
-sgrep "design review" tenant/     # scoped to a path
+sgrep "design review" workspace/     # scoped to a path
 sgrep --literal "exact string"    # regex grep over document bodies
 ```
 

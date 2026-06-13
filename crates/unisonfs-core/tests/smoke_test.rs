@@ -37,7 +37,7 @@ async fn smoke_api_write_read_roundtrip() {
         .whoami()
         .await
         .expect("whoami should succeed with a valid token");
-    eprintln!("smoke: authenticated as {} (tenant: {})", who.user_email, who.tenant_id);
+    eprintln!("smoke: authenticated as {} (workspace: {})", who.user_email, who.workspace_id);
 
     // Write a test document.
     let test_path = format!("/private/notes/smoke-test-{}.md", now_ms());
