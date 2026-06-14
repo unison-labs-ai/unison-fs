@@ -8,6 +8,8 @@
 
 A filesystem for AI agents — mount the [Unison brain](https://unisonlabs.ai) as a real local directory (FUSE on Linux, embedded NFS on macOS) with a local SQLite cache, background sync loop, and semantic `sgrep` command.
 
+The folder is just the surface. Underneath is the [Unison brain](https://github.com/unison-labs-ai/unison-brain#the-hard-part--what-every-memory-system-gets-wrong) — not a flat vector dump but a knowledge graph with **temporal facts that know what changed when**, **entity resolution that knows who's who**, and **one shared source of truth** every agent and teammate reads and writes. So `cat` and `sgrep` return the *current, consistent* answer, not a stale snippet.
+
 [![CI](https://github.com/unison-labs-ai/unison-fs/actions/workflows/ci.yml/badge.svg)](https://github.com/unison-labs-ai/unison-fs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/unison-labs-ai/unison-fs?style=social)](https://github.com/unison-labs-ai/unison-fs)
