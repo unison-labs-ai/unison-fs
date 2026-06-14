@@ -25,10 +25,14 @@ fn config_dir() -> PathBuf {
 }
 
 fn global_path() -> PathBuf {
-    // Mirror @unisonlabs/sdk: ~/.config/unison/config.json
-    if let Some(home) = directories::BaseDirs::new() {
-        return home
-            .config_dir()
+    // Mirror the @unisonlabs CLI/SDK exactly: ~/.config/unison/config.json on
+    // ALL platforms. The SDK uses XDG-style ~/.config even on macOS, whereas
+    // directories::config_dir() resolves to ~/Library/Application Support there
+    // — so config_dir() would never find the CLI's token on a Mac.
+    if let Some(base) = directories::BaseDirs::new() {
+        return base
+            .home_dir()
+            .join(".config")
             .join("unison")
             .join("config.json");
     }
