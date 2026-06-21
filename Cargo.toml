@@ -41,7 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # SQLite cache
 rusqlite = { version = "0.40", features = ["bundled"] }
-directories = "5"
+directories = "6"
 lru = "0.18"
 
 # Mount backends
