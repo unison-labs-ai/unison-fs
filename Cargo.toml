@@ -42,7 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # SQLite cache
 rusqlite = { version = "0.32", features = ["bundled"] }
 directories = "5"
-lru = "0.12"
+lru = "0.18"
 
 # Mount backends
 # fuser is Linux-only: on macOS it requires macFUSE which we deliberately avoid.
