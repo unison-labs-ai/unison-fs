@@ -185,7 +185,7 @@ async fn execute_push(api: &ApiClient, db: &Db, job: &crate::cache::PushJob) -> 
             let req = PutDocReq {
                 path: job.brain_path.clone(),
                 body_md,
-                kind: Some("note".to_string()),
+                kind: Some("wiki_page".to_string()),
                 title,
                 tldr: None,
                 tags: None,
@@ -231,7 +231,7 @@ async fn execute_push(api: &ApiClient, db: &Db, job: &crate::cache::PushJob) -> 
                 api.put_doc(&PutDocReq {
                     path: new_path.clone(),
                     body_md,
-                    kind: Some("note".to_string()),
+                    kind: Some("wiki_page".to_string()),
                     title: None,
                     tldr: None,
                     tags: None,
