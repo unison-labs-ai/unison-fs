@@ -199,7 +199,7 @@ impl UnisonFs {
         api.put_doc(&crate::api::PutDocReq {
             path: rel_path.to_string(),
             body_md: body,
-            kind: Some("note".to_string()),
+            kind: Some("wiki_page".to_string()),
             title: None,
             tldr: None,
             tags: None,

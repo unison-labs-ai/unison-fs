@@ -23,7 +23,7 @@ pub struct Args {
     #[arg(long, short = 'k')]
     pub limit: Option<u32>,
 
-    /// Filter by document kind (note, wiki_page, raw, log, index).
+    /// Filter by document kind (wiki_page, raw, log, index).
     #[arg(long)]
     pub kind: Vec<String>,
 

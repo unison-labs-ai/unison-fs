@@ -50,7 +50,7 @@ async fn smoke_api_write_read_roundtrip() {
         .put_doc(&PutDocReq {
             path: test_path.clone(),
             body_md: test_body.clone(),
-            kind: Some("note".to_string()),
+            kind: Some("wiki_page".to_string()),
             title: Some("Smoke test".to_string()),
             tldr: None,
             tags: None,
@@ -105,7 +105,7 @@ async fn smoke_cache_upsert_and_enqueue() {
         .put_doc(&PutDocReq {
             path: test_path.clone(),
             body_md: test_body.clone(),
-            kind: Some("note".to_string()),
+            kind: Some("wiki_page".to_string()),
             title: None,
             tldr: None,
             tags: None,
