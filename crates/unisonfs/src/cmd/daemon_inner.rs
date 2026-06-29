@@ -36,10 +36,6 @@ pub struct DaemonConfig {
     #[arg(long, default_value = "300")]
     pub deletion_scan_interval_secs: u64,
 
-    /// Memory paths (comma-separated brain path prefixes to sync).
-    #[arg(long, default_value = "")]
-    pub memory_paths: String,
-
     /// Skip importing pre-existing local files on mount.
     #[arg(long)]
     pub no_import: bool,

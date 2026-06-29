@@ -22,15 +22,12 @@ use crate::vfs::{
 use super::db::{Db, PushOp, ROOT_INO, DENTRY_CACHE_MAX};
 use super::file::DbFile;
 use super::hydration::HydrationScheduler;
-use super::profile::{ProfileFile, PROFILE_INO, PROFILE_NAME};
 
 /// SQLite-backed filesystem that fronts the Unison brain.
 pub struct UnisonFs {
     pub(crate) db: Arc<Db>,
     /// Optional API client; `None` in offline / test mode.
     api: Option<Arc<crate::api::ApiClient>>,
-    /// Virtual profile.md backed by GET /v1/brain/profile.
-    profile_file: Option<Arc<ProfileFile>>,
     /// LRU dentry cache to avoid hitting SQLite on every lookup.
     dentry_cache: Mutex<LruCache<(u64, String), u64>>,
     /// Background read-side hydration queue.
@@ -57,7 +54,6 @@ impl UnisonFs {
         Self {
             db,
             api: None,
-            profile_file: None,
             dentry_cache: Mutex::new(LruCache::new(NonZeroUsize::new(DENTRY_CACHE_MAX).unwrap())),
             hydration: HydrationScheduler::new(),
             uid,
@@ -65,15 +61,13 @@ impl UnisonFs {
         }
     }
 
-    /// Create a `UnisonFs` with an API client for cloud sync and profile.
+    /// Create a `UnisonFs` with an API client for cloud sync.
     pub fn with_api(db: Arc<Db>, api: Arc<crate::api::ApiClient>) -> Self {
-        let profile_file = Arc::new(ProfileFile::new(api.clone()));
         #[allow(unsafe_code)]
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         Self {
             db,
             api: Some(api),
-            profile_file: Some(profile_file),
             dentry_cache: Mutex::new(LruCache::new(NonZeroUsize::new(DENTRY_CACHE_MAX).unwrap())),
             hydration: HydrationScheduler::new(),
             uid,
@@ -109,13 +103,6 @@ impl UnisonFs {
             }
             Err(crate::api::ApiError::NotFound) => Ok(()),
             Err(e) => Err(VfsError::Io(std::io::Error::other(e.to_string()))),
-        }
-    }
-
-    /// Warm the profile.md cache from the API.
-    pub async fn warm_profile(&self) {
-        if let Some(pf) = &self.profile_file {
-            pf.warm().await;
         }
     }
 
@@ -502,12 +489,6 @@ impl UnisonFs {
 #[async_trait]
 impl FileSystem for UnisonFs {
     async fn lookup(&self, parent_ino: u64, name: &str) -> VfsResult<Option<FileAttr>> {
-        // Serve the virtual profile.md from root.
-        if parent_ino == ROOT_INO && name == PROFILE_NAME {
-            if let Some(pf) = &self.profile_file {
-                return Ok(Some(pf.profile_attr()));
-            }
-        }
         let Some(ino) = self.lookup_ino(parent_ino, name) else {
             return Ok(None);
         };
@@ -515,11 +496,6 @@ impl FileSystem for UnisonFs {
     }
 
     async fn getattr(&self, ino: u64) -> VfsResult<Option<FileAttr>> {
-        if ino == PROFILE_INO {
-            if let Some(pf) = &self.profile_file {
-                return Ok(Some(pf.profile_attr()));
-            }
-        }
         Ok(self.get_attr_by_ino(ino))
     }
 
@@ -606,11 +582,7 @@ impl FileSystem for UnisonFs {
         if !self.is_dir(ino) {
             return Ok(None);
         }
-        let mut names: Vec<String> = self.children(ino).into_iter().map(|(n, _)| n).collect();
-        // Inject profile.md at root.
-        if ino == ROOT_INO && self.profile_file.is_some() && !names.iter().any(|n| n == PROFILE_NAME) {
-            names.push(PROFILE_NAME.to_string());
-        }
+        let names: Vec<String> = self.children(ino).into_iter().map(|(n, _)| n).collect();
         Ok(Some(names))
     }
 
@@ -619,23 +591,12 @@ impl FileSystem for UnisonFs {
             return Ok(None);
         }
         let children = self.children(ino);
-        let mut entries: Vec<DirEntry> = children
+        let entries: Vec<DirEntry> = children
             .into_iter()
             .filter_map(|(name, child_ino)| {
                 self.get_attr_by_ino(child_ino).map(|attr| DirEntry { name, attr })
             })
             .collect();
-        // Inject profile.md at root.
-        if ino == ROOT_INO {
-            if let Some(pf) = &self.profile_file {
-                if !entries.iter().any(|e| e.name == PROFILE_NAME) {
-                    entries.push(DirEntry {
-                        name: PROFILE_NAME.to_string(),
-                        attr: pf.profile_attr(),
-                    });
-                }
-            }
-        }
         Ok(Some(entries))
     }
 
@@ -677,11 +638,6 @@ impl FileSystem for UnisonFs {
     }
 
     async fn open(&self, ino: u64, _flags: i32) -> VfsResult<BoxedFile> {
-        if ino == PROFILE_INO {
-            if let Some(pf) = &self.profile_file {
-                return Ok(pf.clone());
-            }
-        }
         let attr = self.get_attr_by_ino(ino).ok_or(VfsError::NotFound)?;
         if attr.is_directory() {
             return Err(VfsError::IsDirectory);

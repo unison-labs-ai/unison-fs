@@ -64,29 +64,6 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     );
     let fs = Arc::new(unisonfs_core::cache::UnisonFs::with_api(db, api));
 
-    // Warm the virtual profile.md
-    let fs_profile = fs.clone();
-    tokio::spawn(async move {
-        fs_profile.warm_profile().await;
-    });
-
-    // --- Memory paths ---
-    if !config.memory_paths.is_empty() {
-        let paths: Vec<String> = config
-            .memory_paths
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !paths.is_empty() {
-            if let Some(api_ref) = fs.api() {
-                if let Err(e) = api_ref.update_memory_paths(paths).await {
-                    tracing::warn!("update_memory_paths: {e}");
-                }
-            }
-        }
-    }
-
     // --- Initial pull with progress ---
     reporter.report(StartupProgress {
         phase: Phase::DeletionScan,
