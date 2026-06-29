@@ -7,7 +7,6 @@ pub(crate) mod db;
 mod file;
 mod fs;
 pub mod hydration;
-pub mod profile;
 #[cfg(test)]
 mod tests;
 

@@ -18,8 +18,6 @@ pub fn normalize_brain_path(raw: &str) -> Option<String> {
     // Already under a writable root — pass through
     if raw.starts_with("/private/")
         || raw.starts_with("/workspace/")
-        || raw.starts_with("/wiki/")
-        || raw.starts_with("/skills/")
     {
         return Some(raw.to_string());
     }
@@ -56,8 +54,6 @@ fn slugify(s: &str) -> String {
 pub fn is_writable_path(path: &str) -> bool {
     path.starts_with("/private/")
         || path.starts_with("/workspace/")
-        || path.starts_with("/wiki/")
-        || path.starts_with("/skills/")
 }
 
 /// Return true if the path is under a read-only brain root.

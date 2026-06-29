@@ -26,7 +26,7 @@ Read, write, and `sgrep` the Unison brain like any local folder. Editors, script
 unisonfs login                        # store your UNISON_TOKEN
 unisonfs mount ~/brain                # mount the brain at ~/brain
 ls ~/brain/private/notes/             # browse your private notes
-cat ~/brain/workspace/people/daniel.md   # read a workspace-level doc
+cat ~/brain/private/person/daniel.md     # read an entity doc
 echo "# My Note" > ~/brain/private/notes/idea.md  # write syncs to the brain
 sgrep "auth decisions"                # semantic search
 unisonfs unmount ~/brain              # unmount and drain the push queue
@@ -84,9 +84,11 @@ The mount exposes the Unison brain namespace as a directory tree:
 ~/brain/
   private/           — your private notes and files
     notes/           — default namespace for /private/notes/*.md
+    person/          — entity docs for people  (/private/person/<slug>.md)
+    company/         — entity docs for companies
+    project/         — entity docs for projects
+    decision/        — decision records
   workspace/         — visible to your whole workspace/org
-    people/
-    projects/
     teams/
       eng/           — team-scoped documents
       marketing/

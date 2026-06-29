@@ -54,10 +54,6 @@ pub struct Args {
     #[arg(long, default_value_t = 300)]
     pub deletion_scan_interval: u64,
 
-    /// Brain path prefixes to sync (comma-separated).
-    #[arg(long, default_value = "")]
-    pub memory_paths: String,
-
     /// Skip importing pre-existing local .md files on mount.
     #[arg(long)]
     pub no_import: bool,
@@ -160,24 +156,6 @@ async fn run_foreground(
             .with_user_id(whoami.user_id.clone()),
     );
     let fs = Arc::new(unisonfs_core::cache::UnisonFs::with_api(db, api));
-
-    // Warm profile.md
-    let fs_p = fs.clone();
-    tokio::spawn(async move { fs_p.warm_profile().await });
-
-    // Memory paths
-    if !args.memory_paths.is_empty() {
-        let paths: Vec<String> = args.memory_paths
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !paths.is_empty() {
-            if let Some(api_ref) = fs.api() {
-                let _ = api_ref.update_memory_paths(paths).await;
-            }
-        }
-    }
 
     // Initial pull
     eprintln!("Running initial pull...");
@@ -291,9 +269,6 @@ async fn run_daemon_fork(
         .arg("--deletion-scan-interval-secs")
         .arg(args.deletion_scan_interval.to_string());
 
-    if !args.memory_paths.is_empty() {
-        cmd.arg("--memory-paths").arg(&args.memory_paths);
-    }
     if args.no_import {
         cmd.arg("--no-import");
     }
