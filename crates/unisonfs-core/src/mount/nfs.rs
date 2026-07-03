@@ -111,12 +111,52 @@ pub async fn mount(
 
     tracing::info!("Mounted NFS at {}", mount_path.display());
 
-    // Block until the server stops (i.e. the filesystem is unmounted).
-    serve
-        .await
-        .map_err(|e| anyhow::anyhow!("nfs serve task panicked: {e}"))??;
+    // Block until the filesystem is unmounted. `handle_forever` keeps its
+    // listener open even after the kernel detaches the volume (nothing tells
+    // a TCP server its client unmounted), so awaiting it alone parks the
+    // daemon forever after `umount`. Watch the mount table via statfs and
+    // stop serving once the path is no longer an NFS mount.
+    loop {
+        if serve.is_finished() {
+            serve
+                .await
+                .map_err(|e| anyhow::anyhow!("nfs serve task panicked: {e}"))??;
+            break;
+        }
+        if !is_nfs_mounted(mount_path) {
+            tracing::info!("NFS volume detached; stopping server");
+            serve.abort();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 
     Ok(())
+}
+
+/// Whether `path` is currently an attached NFS mount (statfs-based).
+#[cfg(unix)]
+fn is_nfs_mounted(path: &Path) -> bool {
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut buf: libc::statfs = std::mem::zeroed();
+        if libc::statfs(cpath.as_ptr(), &mut buf) != 0 {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let ty = std::ffi::CStr::from_ptr(buf.f_fstypename.as_ptr());
+            ty.to_string_lossy().starts_with("nfs")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            const NFS_SUPER_MAGIC: i64 = 0x6969;
+            buf.f_type as i64 == NFS_SUPER_MAGIC
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -268,6 +308,14 @@ impl nfsserve::vfs::NFSFileSystem for NfsAdapter {
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_IO)?;
         handle
             .write(offset, data)
+            .await
+            .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_IO)?;
+        // NFSv3 has no close(): unlike FUSE, nothing will ever call flush()
+        // for us, and flush() is what registers the brain path and enqueues
+        // the push. Flush after every WRITE — the push queue coalesces
+        // per-path latest-wins, so multi-chunk writes stay one queue row.
+        handle
+            .flush()
             .await
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_IO)?;
         let attr = handle

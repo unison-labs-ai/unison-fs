@@ -27,6 +27,50 @@ fn ino_by_remote_path_roundtrip() {
     assert_eq!(fs.db().ino_by_remote_path("/nonexistent.md"), None);
 }
 
+// ── 1b. directory mtime bumps on entry changes ───────────────────────────────
+// The macOS NFS client revalidates cached READDIR data by directory mtime; a
+// remotely-created file must move the parent dir's mtime or `ls` never shows
+// it (regression test for the smoke-test failure on 2026-07-03).
+
+#[test]
+fn dentry_changes_bump_parent_dir_mtime() {
+    let fs = open_mem_fs();
+    let ino = fs
+        .upsert_brain_doc("/private/notes/first.md", b"one")
+        .expect("upsert");
+    let dir_ino = fs.db().ino_by_remote_path("/private/notes/first.md").map(|_| ());
+    assert!(dir_ino.is_some());
+    let parent = fs.dentry_of(ino).expect("dentry").0;
+
+    let mtime_before = dir_mtime(&fs, parent);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs.upsert_brain_doc("/private/notes/second.md", b"two")
+        .expect("upsert 2");
+    let mtime_after = dir_mtime(&fs, parent);
+    assert!(
+        mtime_after > mtime_before,
+        "adding an entry must bump dir mtime ({mtime_before} -> {mtime_after})"
+    );
+
+    let ino2 = fs.db().ino_by_remote_path("/private/notes/second.md").unwrap();
+    fs.db().set_remote_id(ino2, "rid-second");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert!(fs.apply_deletion("rid-second").expect("deletion"));
+    let mtime_deleted = dir_mtime(&fs, parent);
+    assert!(
+        mtime_deleted > mtime_after,
+        "removing an entry must bump dir mtime ({mtime_after} -> {mtime_deleted})"
+    );
+}
+
+fn dir_mtime(fs: &Arc<UnisonFs>, ino: u64) -> i64 {
+    let conn = fs.db().conn.lock();
+    conn.query_row("SELECT mtime FROM fs_inode WHERE ino = ?1", [ino as i64], |r| {
+        r.get(0)
+    })
+    .expect("dir mtime")
+}
+
 // ── 2. upsert_brain_doc idempotency ─────────────────────────────────────────
 
 #[test]

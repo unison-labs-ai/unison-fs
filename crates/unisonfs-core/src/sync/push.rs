@@ -185,7 +185,11 @@ async fn execute_push(api: &ApiClient, db: &Db, job: &crate::cache::PushJob) -> 
             let req = PutDocReq {
                 path: job.brain_path.clone(),
                 body_md,
-                kind: Some("note".to_string()),
+                // Omitted: the server's write schema accepts only
+                // wiki_page|raw|log|index and defaults to wiki_page. "note"
+                // was never valid — every push 400-poisoned against current
+                // servers until this was dropped.
+                kind: None,
                 title,
                 tldr: None,
                 tags: None,
@@ -231,7 +235,7 @@ async fn execute_push(api: &ApiClient, db: &Db, job: &crate::cache::PushJob) -> 
                 api.put_doc(&PutDocReq {
                     path: new_path.clone(),
                     body_md,
-                    kind: Some("note".to_string()),
+                    kind: None,
                     title: None,
                     tldr: None,
                     tags: None,

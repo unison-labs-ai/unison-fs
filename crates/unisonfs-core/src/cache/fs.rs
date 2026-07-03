@@ -258,7 +258,8 @@ impl UnisonFs {
                 );
             }
         }
-        // Push the removal into the kernel's dentry/attr cache (FUSE).
+        // Dir mtime bump (NFS readdir revalidation) + kernel inval (FUSE).
+        self.touch_dir(parent_ino);
         self.emit_inval(ino, parent_ino, &name);
         Ok(true)
     }
@@ -399,23 +400,43 @@ impl UnisonFs {
     }
 
     fn insert_dentry(&self, parent_ino: u64, name: &str, child_ino: u64) -> VfsResult<()> {
-        let conn = self.db.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO fs_dentry (parent_ino, name, ino) VALUES (?1, ?2, ?3)",
-            rusqlite::params![parent_ino as i64, name, child_ino as i64],
-        )
-        .map_err(VfsError::Database)?;
+        {
+            let conn = self.db.conn.lock();
+            conn.execute(
+                "INSERT OR REPLACE INTO fs_dentry (parent_ino, name, ino) VALUES (?1, ?2, ?3)",
+                rusqlite::params![parent_ino as i64, name, child_ino as i64],
+            )
+            .map_err(VfsError::Database)?;
+        }
+        self.touch_dir(parent_ino);
         Ok(())
     }
 
     fn remove_dentry(&self, parent_ino: u64, name: &str) -> VfsResult<()> {
-        let conn = self.db.conn.lock();
-        conn.execute(
-            "DELETE FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
-            rusqlite::params![parent_ino as i64, name],
-        )
-        .map_err(VfsError::Database)?;
+        {
+            let conn = self.db.conn.lock();
+            conn.execute(
+                "DELETE FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+                rusqlite::params![parent_ino as i64, name],
+            )
+            .map_err(VfsError::Database)?;
+        }
+        self.touch_dir(parent_ino);
         Ok(())
+    }
+
+    /// Bump a directory's mtime/ctime after its entry set changed. POSIX
+    /// semantics — and load-bearing for the NFS backend: the macOS client
+    /// revalidates its cached READDIR data by directory mtime, so without
+    /// this a remotely-created file stays invisible in `ls` forever, not
+    /// just for the attr-cache window.
+    fn touch_dir(&self, ino: u64) {
+        let now = Timestamp::now();
+        let conn = self.db.conn.lock();
+        let _ = conn.execute(
+            "UPDATE fs_inode SET mtime = ?2, ctime = ?2, mtime_nsec = ?3, ctime_nsec = ?3 WHERE ino = ?1",
+            rusqlite::params![ino as i64, now.sec, now.nsec as i64],
+        );
     }
 
     fn children(&self, ino: u64) -> Vec<(String, u64)> {
