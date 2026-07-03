@@ -52,6 +52,10 @@ impl Db {
             "ALTER TABLE push_queue ADD COLUMN last_status INTEGER",
             // Remote document id (for deletion scan + inflight poller).
             "ALTER TABLE fs_remote ADD COLUMN remote_id TEXT",
+            // Server-side content hash of the last synced version. Lets the
+            // pull loop skip re-fetching a body the cache already holds
+            // (own-write echo, resync after 410).
+            "ALTER TABLE fs_remote ADD COLUMN content_hash TEXT",
         ];
         for sql in migrations {
             if let Err(e) = conn.execute(sql, []) {
@@ -404,13 +408,46 @@ impl Db {
     }
 
     /// Set the remote document id for an inode.
-    #[allow(dead_code)]
     pub(crate) fn set_remote_id(&self, ino: u64, remote_id: &str) {
         let conn = self.conn.lock();
         let _ = conn.execute(
             "UPDATE fs_remote SET remote_id = ?2 WHERE ino = ?1",
             rusqlite::params![ino as i64, remote_id],
         );
+    }
+
+    /// Server content hash of the last version synced into this inode.
+    pub(crate) fn remote_content_hash(&self, ino: u64) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT content_hash FROM fs_remote WHERE ino = ?1",
+            [ino as i64],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Record the server content hash for an inode's synced version.
+    pub(crate) fn set_remote_content_hash(&self, ino: u64, hash: Option<&str>) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "UPDATE fs_remote SET content_hash = ?2 WHERE ino = ?1",
+            rusqlite::params![ino as i64, hash],
+        );
+    }
+
+    /// All known remote document ids (rows without one yet are skipped).
+    pub(crate) fn all_remote_ids(&self) -> Vec<String> {
+        let conn = self.conn.lock();
+        let Ok(mut stmt) = conn.prepare("SELECT remote_id FROM fs_remote WHERE remote_id IS NOT NULL")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     pub(crate) fn read_all_content(&self, ino: u64) -> Vec<u8> {

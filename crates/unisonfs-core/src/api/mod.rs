@@ -284,6 +284,69 @@ impl ApiClient {
             .await
     }
 
+    /// GET /v1/brain/changes — cursor-paginated doc changes incl. deletion
+    /// tombstones (changes-feed spec). `since = None` bootstraps the full
+    /// live doc set. Callers map `ApiError::NotFound` to "server predates the
+    /// feed" and `ApiError::Rejected { status: 410, .. }` to "cursor expired,
+    /// resync required".
+    pub async fn changes(
+        &self,
+        since: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<ChangesResp, ApiError> {
+        let mut params = Vec::new();
+        if let Some(s) = since {
+            params.push(format!("since={}", urlencoding(s)));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        let qs = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
+        self.get(&format!("/v1/brain/changes{qs}"))
+            .send_with_retry()
+            .await?
+            .parse_json()
+            .await
+    }
+
+    /// GET /v1/brain/changes/stream — open the SSE doorbell stream. Returns
+    /// the raw response for the caller to consume as a byte stream. Uses a
+    /// dedicated HTTP client with NO total timeout (the shared client's 30s
+    /// timeout would kill a long-lived stream); the caller enforces its own
+    /// idle timeout keyed to the server's 30s heartbeats.
+    pub async fn open_changes_stream(&self) -> Result<reqwest::Response, ApiError> {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(ApiError::Network)?;
+        let resp = client
+            .get(format!("{}/v1/brain/changes/stream", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+            .map_err(ApiError::Network)?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        match status {
+            StatusCode::UNAUTHORIZED => Err(ApiError::Auth),
+            StatusCode::NOT_FOUND => Err(ApiError::NotFound),
+            _ => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(ApiError::Rejected {
+                    status: status.as_u16(),
+                    body,
+                })
+            }
+        }
+    }
+
     /// GET /v1/brain/fs?path=<path> — directory listing.
     pub async fn fs_list(&self, path: &str) -> Result<FsListResp, ApiError> {
         let encoded = urlencoding(path);

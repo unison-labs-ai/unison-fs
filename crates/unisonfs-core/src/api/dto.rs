@@ -86,6 +86,29 @@ pub struct DeleteDocResp {
     pub deleted: bool,
 }
 
+/// One entry from GET /v1/brain/changes — a doc that changed (no body) or a
+/// deletion tombstone.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeEntry {
+    pub id: String,
+    pub path: String,
+    pub kind: Option<String>,
+    pub body_length: Option<i64>,
+    pub content_hash: Option<String>,
+    pub updated_at: String,
+    pub deleted: bool,
+}
+
+/// Response from GET /v1/brain/changes.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangesResp {
+    pub changes: Vec<ChangeEntry>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
 /// GET /v1/brain/list parameters.
 #[derive(Debug, Default)]
 pub struct ListDocsReq {

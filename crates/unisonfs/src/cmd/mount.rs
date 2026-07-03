@@ -46,12 +46,13 @@ pub struct Args {
     #[arg(long, env = "UNISON_API_URL")]
     pub api_url: Option<String>,
 
-    /// Pull interval in seconds (default 30).
-    #[arg(long, default_value_t = 30)]
+    /// Pull interval in seconds (default 15).
+    #[arg(long, default_value_t = 15)]
     pub sync_interval: u64,
 
-    /// Deletion scan interval in seconds (default 300).
-    #[arg(long, default_value_t = 300)]
+    /// Deletion scan interval in seconds (default 21600 = 6h; the changes
+    /// feed's tombstones handle deletions — this is a safety net).
+    #[arg(long, default_value_t = 21600)]
     pub deletion_scan_interval: u64,
 
     /// Brain path prefixes to sync (comma-separated).
@@ -227,7 +228,8 @@ async fn run_foreground(
         deletion_scan_interval: Duration::from_secs(args.deletion_scan_interval),
         pull_enabled: !args.no_import,
     };
-    let mut task_set = SyncEngine::start(fs.clone(), sync_opts, shutdown_rx);
+    let sync_wake = Arc::new(tokio::sync::Notify::new());
+    let mut task_set = SyncEngine::start(fs.clone(), sync_opts, shutdown_rx, sync_wake);
 
     eprintln!(
         "Mounted Unison brain at {} (backend: {}, tag: {})",
@@ -242,8 +244,9 @@ async fn run_foreground(
     match backend {
         MountBackend::Fuse => {
             let mp = mount_path.clone();
+            let fs_inval = fs.clone();
             let join = tokio::task::spawn_blocking(move || {
-                unisonfs_core::mount::fuse::mount(fs_dyn, &mp)
+                unisonfs_core::mount::fuse::mount(fs_dyn, &mp, Some(fs_inval))
             });
             join.await??;
         }
@@ -293,6 +296,9 @@ async fn run_daemon_fork(
 
     if !args.memory_paths.is_empty() {
         cmd.arg("--memory-paths").arg(&args.memory_paths);
+    }
+    if args.clean {
+        cmd.arg("--clean");
     }
     if args.no_import {
         cmd.arg("--no-import");

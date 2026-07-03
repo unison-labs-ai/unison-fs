@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::api::{ApiClient, ProfileResp};
+use crate::cache::Db;
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::mode::S_IFREG;
 use crate::vfs::types::{FileAttr, Timestamp};
@@ -18,17 +19,62 @@ use crate::vfs::types::{FileAttr, Timestamp};
 pub const PROFILE_INO: u64 = u64::MAX - 1;
 pub const PROFILE_NAME: &str = "profile.md";
 
+/// Pull silence after which profile.md starts carrying a staleness banner.
+/// Sync failures are otherwise WARN-only in a detached daemon's log — this is
+/// the one place a reader of the mount actually sees that the mirror stopped.
+const STALE_AFTER_MS: i64 = 10 * 60 * 1000;
+
 #[derive(Debug)]
 pub struct ProfileFile {
     api: Arc<ApiClient>,
+    db: Option<Arc<Db>>,
     cache: RwLock<Option<Vec<u8>>>,
 }
 
 impl ProfileFile {
-    pub fn new(api: Arc<ApiClient>) -> Self {
+    pub fn new(api: Arc<ApiClient>, db: Option<Arc<Db>>) -> Self {
         Self {
             api,
+            db,
             cache: RwLock::new(None),
+        }
+    }
+
+    /// Banner prepended to profile.md while the sync loop is silently failing.
+    fn staleness_banner(&self) -> Option<Vec<u8>> {
+        let db = self.db.as_ref()?;
+        let last: i64 = db
+            .sync_meta_get(crate::sync::pull::SYNC_META_LAST_PULL_AT)?
+            .parse()
+            .ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let silent_ms = now - last;
+        if silent_ms < STALE_AFTER_MS {
+            return None;
+        }
+        Some(
+            format!(
+                "⚠ SYNC STALE: last successful brain sync was {} minutes ago — \
+                 mounted files may not reflect the brain's current state.\n\n",
+                silent_ms / 60_000
+            )
+            .into_bytes(),
+        )
+    }
+
+    /// The bytes read() serves: staleness banner (if any) + cached profile.
+    fn content_bytes(&self) -> Vec<u8> {
+        let cache = self.cache.read();
+        let body = cache.as_deref().unwrap_or(&[]);
+        match self.staleness_banner() {
+            Some(mut banner) => {
+                banner.extend_from_slice(body);
+                banner
+            }
+            None => body.to_vec(),
         }
     }
 
@@ -49,12 +95,9 @@ impl ProfileFile {
 
     pub fn profile_attr(&self) -> FileAttr {
         let now = Timestamp::now();
-        let size = self
-            .cache
-            .read()
-            .as_ref()
-            .map(|v| v.len() as u64)
-            .unwrap_or(0);
+        // Sized over the same view read() serves (banner included) so a
+        // reader never gets a short read or trailing garbage.
+        let size = self.content_bytes().len() as u64;
         FileAttr {
             ino: PROFILE_INO,
             mode: S_IFREG | 0o444,
@@ -75,10 +118,7 @@ impl ProfileFile {
 #[async_trait]
 impl crate::vfs::traits::File for ProfileFile {
     async fn read(&self, offset: u64, size: usize) -> VfsResult<Vec<u8>> {
-        let cache = self.cache.read();
-        let Some(content) = cache.as_ref() else {
-            return Ok(Vec::new());
-        };
+        let content = self.content_bytes();
         let offset = offset as usize;
         if offset >= content.len() {
             return Ok(Vec::new());

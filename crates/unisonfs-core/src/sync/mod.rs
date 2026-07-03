@@ -2,24 +2,33 @@
 //!
 //! Four loops:
 //!
-//! - **Loop A — delta pull.** Every ~30s, walk `/v1/brain/list` sorted by
-//!   `updatedAt desc` and reconcile anything newer than our watermark.
-//! - **Loop C — deletion scan.** Every ~5min, diff the full remote doc list
-//!   against local `fs_remote` and unlink anything that disappeared.
+//! - **Loop A — delta pull.** Every ~15s (or immediately on a wake signal),
+//!   drain the server's changes feed from the persisted cursor — updates,
+//!   creations, and deletion tombstones in one pass. Falls back to the
+//!   legacy `/v1/brain/list` watermark pull on pre-feed servers.
+//! - **Loop C — deletion scan.** Every ~6h, diff the full remote doc list
+//!   against local `fs_remote` — a reconciliation safety net behind the
+//!   feed's tombstones.
 //! - **Loop D — push worker.** Claims queued push jobs from `push_queue`.
 //! - **Loop F — hydration worker.** Pulls missed/stale files on read misses.
 
 pub mod pull;
 pub mod push;
 pub mod scan;
+pub mod stream;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::task::JoinSet;
 
 use crate::cache::UnisonFs;
+
+/// Poll cadence while the wake stream is healthy — a slow safety net behind
+/// push events, not the freshness mechanism.
+const STREAM_FALLBACK_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy)]
 pub enum InitialPullProgress {
@@ -38,8 +47,13 @@ pub struct SyncOptions {
 impl Default for SyncOptions {
     fn default() -> Self {
         Self {
-            delta_interval: Duration::from_secs(30),
-            deletion_scan_interval: Duration::from_secs(300),
+            // 15s: with the cursor feed a poll is one indexed query that
+            // usually returns zero rows — cheap enough to keep worst-case
+            // staleness under ~16s without any push channel.
+            delta_interval: Duration::from_secs(15),
+            // The feed's tombstones are the primary deletion mechanism now;
+            // the full-list diff is a rare reconciliation safety net.
+            deletion_scan_interval: Duration::from_secs(6 * 60 * 60),
             pull_enabled: true,
         }
     }
@@ -81,20 +95,38 @@ impl SyncEngine {
     }
 
     /// Spawn background loops. Returns a `JoinSet` whose tasks exit when
-    /// `shutdown.send(true)` is called.
+    /// `shutdown.send(true)` is called. `wake` short-circuits the delta
+    /// loop's sleep — fired by IPC `Sync` requests (and, later, the server's
+    /// change-stream doorbell) to pull immediately instead of waiting out
+    /// the interval.
     pub fn start(
         fs: Arc<UnisonFs>,
         opts: SyncOptions,
         shutdown: watch::Receiver<bool>,
+        wake: Arc<Notify>,
     ) -> JoinSet<()> {
         let mut set = JoinSet::new();
 
         if opts.pull_enabled {
+            let stream_healthy = Arc::new(AtomicBool::new(false));
+
             let fs_a = fs.clone();
             let mut sd_a = shutdown.clone();
+            let wake_a = wake.clone();
+            let healthy_a = stream_healthy.clone();
             set.spawn(async move {
-                run_delta_loop(fs_a, opts.delta_interval, &mut sd_a).await;
+                run_delta_loop(fs_a, opts.delta_interval, &mut sd_a, wake_a, healthy_a).await;
             });
+
+            // Wake stream (Layer 2): push doorbell that fires `wake`; the
+            // delta loop demotes itself to a slow fallback while it's up.
+            if let Some(api) = fs.api() {
+                let api_s = api.clone();
+                let sd_s = shutdown.clone();
+                set.spawn(async move {
+                    stream::run_stream_loop(api_s, wake, stream_healthy, sd_s).await;
+                });
+            }
 
             let fs_c = fs.clone();
             let mut sd_c = shutdown.clone();
@@ -133,29 +165,39 @@ async fn run_delta_loop(
     fs: Arc<UnisonFs>,
     base_interval: Duration,
     shutdown: &mut watch::Receiver<bool>,
+    wake: Arc<Notify>,
+    stream_healthy: Arc<AtomicBool>,
 ) {
-    let mut empty_streak = 0u32;
+    // Fixed cadence, not adaptive: a cursor-feed poll with nothing new is a
+    // single indexed query, so stretching the interval when idle would trade
+    // real staleness for a negligible saving. ±2s jitter avoids lockstep
+    // across mounts. While the wake stream is connected, events drive the
+    // syncs and the interval demotes to a slow missed-event safety net.
     loop {
-        let interval = adaptive_interval(base_interval, empty_streak);
+        let interval = if stream_healthy.load(Ordering::Relaxed) {
+            STREAM_FALLBACK_INTERVAL.max(base_interval)
+        } else {
+            base_interval
+        };
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(jittered(interval, 2)) => {}
+            _ = wake.notified() => {
+                tracing::debug!("delta pull woken early");
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { return; }
             }
         }
 
         match pull::delta_pull(&fs).await {
-            Ok(n) => {
-                if n == 0 {
-                    empty_streak = empty_streak.saturating_add(1);
-                } else {
-                    empty_streak = 0;
-                    tracing::debug!(reconciled = n, "delta pull");
-                }
+            Ok(n) if n > 0 => {
+                tracing::debug!(reconciled = n, "delta pull");
+                // The profile derives from the memory graph; changed docs can
+                // shift it. Debounced to at most one warm per 30s.
+                fs.rewarm_profile_debounced().await;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "delta pull failed");
-            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "delta pull failed"),
         }
     }
 }
@@ -180,19 +222,6 @@ async fn run_deletion_loop(
             Err(e) => tracing::warn!(error = %e, "deletion scan failed"),
         }
     }
-}
-
-/// Adaptive cadence: shorter after activity, stretch when idle, add ±jitter.
-fn adaptive_interval(base: Duration, empty_streak: u32) -> Duration {
-    let secs = base.as_secs_f64();
-    let adjusted = if empty_streak == 0 {
-        (secs / 3.0).max(10.0)
-    } else if empty_streak >= 3 {
-        (secs * 2.0).min(60.0)
-    } else {
-        secs
-    };
-    jittered(Duration::from_secs_f64(adjusted), 5)
 }
 
 /// Add uniform ±`max_jitter_secs` jitter to an interval (never below 1s).

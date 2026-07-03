@@ -69,11 +69,15 @@ pub async fn mount(
         // mount enough grace for the localhost server to answer the first I/O
         // RPCs instead of failing them with EPERM. No `resvport` (would force
         // sudo) and no `nfc`. Absolute path: a non-root shell may lack /sbin.
+        // `actimeo=1`: without it the macOS NFS client caches attributes for
+        // its default 5-60s, hiding brain changes the sync engine already
+        // pulled. The server is this same process on loopback, so the extra
+        // GETATTR round-trips are sub-millisecond.
         let status = tokio::process::Command::new("/sbin/mount_nfs")
             .args([
                 "-o",
                 &format!(
-                    "locallocks,vers=3,tcp,port={port},mountport={port},soft,timeo=10,retrans=2"
+                    "locallocks,vers=3,tcp,port={port},mountport={port},soft,timeo=10,retrans=2,actimeo=1"
                 ),
                 "127.0.0.1:/",
                 &*mount_path_str,
@@ -93,7 +97,7 @@ pub async fn mount(
                 "nfs",
                 "-o",
                 &format!(
-                    "vers=3,tcp,port={port},mountport={port},nolock,soft,timeo=10,retrans=2"
+                    "vers=3,tcp,port={port},mountport={port},nolock,soft,timeo=10,retrans=2,actimeo=1"
                 ),
                 "127.0.0.1:/",
                 &*mount_path_str,

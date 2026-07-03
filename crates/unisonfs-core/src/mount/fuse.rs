@@ -582,14 +582,19 @@ impl Filesystem for FuseAdapter {
 ///
 /// Blocks until unmount. Intended to be called from a `spawn_blocking` task or
 /// a dedicated OS thread — never from an `async` context directly, because
-/// `fuser::mount2` drives a synchronous event loop.
+/// Drives a synchronous FUSE event loop (background thread + join).
 ///
-/// The `rt` parameter has been removed: `FuseAdapter` now owns its own
-/// `current_thread` runtime so it never borrows workers from the caller's pool.
+/// `inval_target`: when the concrete `UnisonFs` is supplied, the session's
+/// kernel notifier is installed as its invalidation sink, so remotely-applied
+/// sync changes actively evict the kernel's dentry/attr/page cache. That is
+/// what lets the attr TTL stay effectively infinite ([`TTL`]) without serving
+/// stale reads: the daemon is the only *local* writer, and every *remote*
+/// write arrives through the sync engine, which rings this bell.
 #[cfg(target_os = "linux")]
 pub fn mount(
     fs: Arc<dyn FileSystem + 'static>,
     mount_path: &Path,
+    inval_target: Option<Arc<crate::cache::UnisonFs>>,
 ) -> anyhow::Result<()> {
     let mut config = Config::default();
     config.mount_options = vec![
@@ -598,7 +603,18 @@ pub fn mount(
     ];
     config.acl = SessionACL::RootAndOwner;
     let adapter = FuseAdapter::new(fs);
-    fuser::mount2(adapter, mount_path, &config)?;
+    let session = fuser::Session::new(adapter, mount_path, &config)?;
+    let background = session.spawn()?;
+    if let Some(target) = inval_target {
+        let notifier = background.notifier();
+        target.install_inval_sink(Box::new(move |ev: crate::cache::InvalEvent| {
+            // ENOENT from the kernel just means "nothing was cached" — fine.
+            let _ = notifier.inval_entry(INodeNo(ev.parent_ino), OsStr::new(&ev.name));
+            // offset 0 + len 0 = drop attrs and the whole cached data range.
+            let _ = notifier.inval_inode(INodeNo(ev.ino), 0, 0);
+        }));
+    }
+    background.join()?;
     Ok(())
 }
 
@@ -607,6 +623,7 @@ pub fn mount(
 pub fn mount(
     _fs: std::sync::Arc<dyn crate::vfs::FileSystem>,
     _mount_path: &std::path::Path,
+    _inval_target: Option<std::sync::Arc<crate::cache::UnisonFs>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("FUSE backend is only supported on Linux; use --backend nfs on macOS")
 }

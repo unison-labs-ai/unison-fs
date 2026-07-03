@@ -24,6 +24,19 @@ use super::file::DbFile;
 use super::hydration::HydrationScheduler;
 use super::profile::{ProfileFile, PROFILE_INO, PROFILE_NAME};
 
+/// A remotely-applied namespace change the kernel may have cached. Fed to the
+/// mount backend's invalidation sink (FUSE only — its attr/entry TTL is
+/// effectively infinite, so remote changes MUST be pushed into the kernel;
+/// the NFS backend relies on `actimeo=1` instead).
+#[derive(Debug, Clone)]
+pub struct InvalEvent {
+    pub ino: u64,
+    pub parent_ino: u64,
+    pub name: String,
+}
+
+type InvalSink = Box<dyn Fn(InvalEvent) + Send + Sync>;
+
 /// SQLite-backed filesystem that fronts the Unison brain.
 pub struct UnisonFs {
     pub(crate) db: Arc<Db>,
@@ -35,6 +48,10 @@ pub struct UnisonFs {
     dentry_cache: Mutex<LruCache<(u64, String), u64>>,
     /// Background read-side hydration queue.
     hydration: Arc<HydrationScheduler>,
+    /// Kernel-cache invalidation callback, installed by the FUSE backend.
+    inval_sink: parking_lot::RwLock<Option<InvalSink>>,
+    /// Last profile.md re-warm (epoch ms) — debounces change-driven warms.
+    profile_warmed_at: std::sync::atomic::AtomicI64,
     /// Owning UID/GID for new inodes (from the process at mount time).
     uid: u32,
     gid: u32,
@@ -60,6 +77,8 @@ impl UnisonFs {
             profile_file: None,
             dentry_cache: Mutex::new(LruCache::new(NonZeroUsize::new(DENTRY_CACHE_MAX).unwrap())),
             hydration: HydrationScheduler::new(),
+            inval_sink: parking_lot::RwLock::new(None),
+            profile_warmed_at: std::sync::atomic::AtomicI64::new(0),
             uid,
             gid,
         }
@@ -67,7 +86,7 @@ impl UnisonFs {
 
     /// Create a `UnisonFs` with an API client for cloud sync and profile.
     pub fn with_api(db: Arc<Db>, api: Arc<crate::api::ApiClient>) -> Self {
-        let profile_file = Arc::new(ProfileFile::new(api.clone()));
+        let profile_file = Arc::new(ProfileFile::new(api.clone(), Some(db.clone())));
         #[allow(unsafe_code)]
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         Self {
@@ -76,6 +95,8 @@ impl UnisonFs {
             profile_file: Some(profile_file),
             dentry_cache: Mutex::new(LruCache::new(NonZeroUsize::new(DENTRY_CACHE_MAX).unwrap())),
             hydration: HydrationScheduler::new(),
+            inval_sink: parking_lot::RwLock::new(None),
+            profile_warmed_at: std::sync::atomic::AtomicI64::new(0),
             uid,
             gid,
         }
@@ -117,6 +138,53 @@ impl UnisonFs {
         if let Some(pf) = &self.profile_file {
             pf.warm().await;
         }
+        self.profile_warmed_at
+            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Re-warm profile.md after remote changes, at most once per 30s. The
+    /// profile derives from the brain's memory graph, so any doc change can
+    /// shift it; the debounce keeps a busy sync burst from hammering the API.
+    pub async fn rewarm_profile_debounced(&self) {
+        const MIN_GAP_MS: i64 = 30_000;
+        let last = self
+            .profile_warmed_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now_ms() - last < MIN_GAP_MS {
+            return;
+        }
+        self.warm_profile().await;
+    }
+
+    /// Install the kernel-cache invalidation callback. The FUSE backend hooks
+    /// its notifier here; the sync engine then pushes every remotely-applied
+    /// change into the kernel instead of waiting out an attr-cache TTL.
+    pub fn install_inval_sink(&self, sink: Box<dyn Fn(InvalEvent) + Send + Sync>) {
+        *self.inval_sink.write() = Some(sink);
+    }
+
+    /// Emit a kernel invalidation for a remotely-changed inode (no-op unless
+    /// a sink is installed).
+    pub fn emit_inval(&self, ino: u64, parent_ino: u64, name: &str) {
+        let guard = self.inval_sink.read();
+        if let Some(sink) = guard.as_ref() {
+            sink(InvalEvent {
+                ino,
+                parent_ino,
+                name: name.to_string(),
+            });
+        }
+    }
+
+    /// The dentry (parent inode, name) currently pointing at `ino`.
+    pub fn dentry_of(&self, ino: u64) -> Option<(u64, String)> {
+        let conn = self.db.conn.lock();
+        conn.query_row(
+            "SELECT parent_ino, name FROM fs_dentry WHERE ino = ?1",
+            [ino as i64],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+        )
+        .ok()
     }
 
     /// How many entries are currently in the push queue.
@@ -127,6 +195,13 @@ impl UnisonFs {
     /// How many remote documents are currently tracked in the local cache.
     pub fn remote_count(&self) -> usize {
         self.db.remote_count()
+    }
+
+    /// When the last successful pull round-trip completed (epoch ms), if ever.
+    pub fn last_pull_at_ms(&self) -> Option<i64> {
+        self.db
+            .sync_meta_get(crate::sync::pull::SYNC_META_LAST_PULL_AT)
+            .and_then(|v| v.parse().ok())
     }
 
     /// Resolve a local remote-id to an inode number (used by deletion scan).
@@ -156,6 +231,9 @@ impl UnisonFs {
             (Some(p), Some(n)) => (p, n),
             _ => return Ok(false),
         };
+        // Drop the in-memory dentry cache entry so a follow-up lookup can't
+        // resolve the name to the inode we're about to remove.
+        self.dentry_cache.lock().pop(&(parent_ino, name.clone()));
         {
             let conn = self.db.conn.lock();
             let _ = conn.execute(
@@ -180,6 +258,8 @@ impl UnisonFs {
                 );
             }
         }
+        // Push the removal into the kernel's dentry/attr cache (FUSE).
+        self.emit_inval(ino, parent_ino, &name);
         Ok(true)
     }
 

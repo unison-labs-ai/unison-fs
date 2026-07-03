@@ -127,7 +127,7 @@ fn apply_deletion_removes_inode() {
 
     fs.db().set_remote_id(ino, "remote-abc-123");
 
-    fs.apply_deletion("remote-abc-123");
+    assert!(fs.apply_deletion("remote-abc-123").expect("apply_deletion"));
     assert_eq!(
         fs.db().ino_by_remote_path(path),
         None,

@@ -29,16 +29,20 @@ pub struct DaemonConfig {
     pub log_level: String,
 
     /// Pull interval in seconds.
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "15")]
     pub delta_interval_secs: u64,
 
-    /// Deletion scan interval in seconds.
-    #[arg(long, default_value = "300")]
+    /// Deletion scan interval in seconds (safety net behind feed tombstones).
+    #[arg(long, default_value = "21600")]
     pub deletion_scan_interval_secs: u64,
 
     /// Memory paths (comma-separated brain path prefixes to sync).
     #[arg(long, default_value = "")]
     pub memory_paths: String,
+
+    /// Delete the local cache before mounting (pulls fresh from the brain).
+    #[arg(long)]
+    pub clean: bool,
 
     /// Skip importing pre-existing local files on mount.
     #[arg(long)]

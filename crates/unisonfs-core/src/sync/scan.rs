@@ -80,16 +80,7 @@ async fn deletion_scan_inner(
     }
 
     // Read local ids and remove anything absent from remote.
-    let local_ids: Vec<String> = {
-        let conn = fs.db().conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT remote_id FROM fs_remote")
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| anyhow::anyhow!(e))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
+    let local_ids: Vec<String> = fs.db().all_remote_ids();
 
     let mut removed = 0usize;
     for id in local_ids {

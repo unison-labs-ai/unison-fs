@@ -52,6 +52,9 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
 
     // --- Open SQLite cache ---
     let db_path = unisonfs_core::config::cache_db_path_for_tag(&whoami.workspace_id, tag);
+    if config.clean {
+        let _ = std::fs::remove_file(&db_path);
+    }
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -136,7 +139,91 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         deletion_scan_interval: Duration::from_secs(config.deletion_scan_interval_secs),
         pull_enabled: true,
     };
-    let mut task_set = SyncEngine::start(fs.clone(), sync_opts, shutdown_rx.clone());
+    let sync_wake = Arc::new(tokio::sync::Notify::new());
+    let mut task_set =
+        SyncEngine::start(fs.clone(), sync_opts, shutdown_rx.clone(), sync_wake.clone());
+
+    // --- IPC server (unisonfs sync/status/unmount talk to this socket) ---
+    let ipc_shutdown = Arc::new(tokio::sync::Notify::new());
+    let unmount_requested = Arc::new(tokio::sync::Notify::new());
+    {
+        let socket = unisonfs_core::daemon::socket_path(tag);
+        let ipc_shutdown = ipc_shutdown.clone();
+        let wake = sync_wake.clone();
+        let unmount_req = unmount_requested.clone();
+        let fs_for_ipc = fs.clone();
+        let status_tag = tag.clone();
+        let status_mount = mount_path.display().to_string();
+        tokio::spawn(async move {
+            let handler = move |req: unisonfs_core::daemon::protocol::Request| {
+                use unisonfs_core::daemon::protocol::{DaemonStatus, Request, Response};
+                match req {
+                    Request::Ping => Response::Pong,
+                    Request::Sync => {
+                        wake.notify_one();
+                        Response::Ok
+                    }
+                    Request::Shutdown => {
+                        unmount_req.notify_one();
+                        Response::Ok
+                    }
+                    Request::Status => Response::Status(DaemonStatus {
+                        tag: status_tag.clone(),
+                        mount_path: status_mount.clone(),
+                        push_queue_len: fs_for_ipc.push_queue_len(),
+                        last_pull_at: fs_for_ipc.last_pull_at_ms(),
+                        pid: std::process::id(),
+                    }),
+                }
+            };
+            if let Err(e) = unisonfs_core::daemon::ipc::serve(&socket, ipc_shutdown, handler).await
+            {
+                tracing::warn!(error = %e, "ipc server exited");
+            }
+        });
+    }
+
+    // A Shutdown request can't interrupt the blocking mount call directly —
+    // unmounting the filesystem is what makes it return. Run the platform
+    // unmount from a helper task when asked.
+    {
+        let mp = mount_path.clone();
+        tokio::spawn(async move {
+            unmount_requested.notified().await;
+            tracing::info!("shutdown requested via IPC; unmounting {}", mp.display());
+            let path = mp.display().to_string();
+            #[cfg(target_os = "macos")]
+            {
+                let ok = tokio::process::Command::new("/sbin/umount")
+                    .arg(&path)
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    let _ = tokio::process::Command::new("/usr/sbin/diskutil")
+                        .args(["unmount", "force", &path])
+                        .status()
+                        .await;
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let ok = tokio::process::Command::new("fusermount")
+                    .args(["-u", &path])
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    let _ = tokio::process::Command::new("umount")
+                        .arg(&path)
+                        .status()
+                        .await;
+                }
+            }
+        });
+    }
 
     // --- Agent hint injection ---
     if !config.no_agent_hint {
@@ -164,8 +251,9 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     match backend {
         MountBackend::Fuse => {
             let mp = mount_path.clone();
+            let fs_inval = fs.clone();
             let join = tokio::task::spawn_blocking(move || {
-                unisonfs_core::mount::fuse::mount(fs_dyn, &mp)
+                unisonfs_core::mount::fuse::mount(fs_dyn, &mp, Some(fs_inval))
             });
             // Write marker after mount is ready
             let _ = std::fs::write(&marker_path, &marker_text);
@@ -180,6 +268,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
 
     // --- Shutdown ---
     let _ = shutdown_tx.send(true);
+    ipc_shutdown.notify_one();
 
     // Drain remaining tasks with a timeout
     let drain = async {
