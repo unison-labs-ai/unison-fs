@@ -46,7 +46,12 @@ enum PullError {
 fn map_changes_err(e: ApiError) -> PullError {
     match e {
         ApiError::NotFound => PullError::NoChangesFeed,
-        ApiError::Rejected { status: 410, .. } => PullError::ResyncRequired,
+        // 410: cursor older than tombstone retention. 400: cursor the server
+        // can't decode (e.g. the opaque format evolved). Both mean the same
+        // thing for us — this cursor is useless, bootstrap fresh.
+        ApiError::Rejected { status: 410, .. } | ApiError::Rejected { status: 400, .. } => {
+            PullError::ResyncRequired
+        }
         other => PullError::Other(anyhow::anyhow!("changes feed failed: {other}")),
     }
 }
@@ -61,7 +66,7 @@ pub async fn delta_pull(fs: &Arc<UnisonFs>) -> anyhow::Result<usize> {
         Some(cursor) => match cursor_delta(fs, api, &cursor).await {
             Ok(n) => Ok(n),
             Err(PullError::ResyncRequired) => {
-                tracing::warn!("changes cursor expired (410); running full resync");
+                tracing::warn!("changes cursor rejected (expired or invalid); running full resync");
                 cursor_bootstrap(fs, api, None).await.map_err(pull_err)
             }
             Err(PullError::NoChangesFeed) => legacy_delta_pull(fs, api).await,
@@ -224,6 +229,17 @@ async fn cursor_bootstrap(
     Ok(reconciled)
 }
 
+/// Whether a fetch/apply failure should abort the batch (transient — retry
+/// the same page next tick, no data loss) or skip just this doc (deterministic
+/// — retrying forever would wedge the cursor and stall every later change).
+/// Skipped docs are handed to the hydration queue as a self-heal path.
+fn is_transient(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::Network(_) | ApiError::Server { .. } | ApiError::RateLimited | ApiError::Auth
+    )
+}
+
 /// Apply one feed entry. Returns true when it changed local state.
 async fn apply_change(
     fs: &Arc<UnisonFs>,
@@ -265,7 +281,17 @@ async fn apply_change(
     match api.get_doc(&ch.path).await {
         Ok(doc) => {
             let content = doc.body_md.as_deref().unwrap_or("").as_bytes().to_vec();
-            let ino = fs.upsert_brain_doc(&ch.path, &content)?;
+            let ino = match fs.upsert_brain_doc(&ch.path, &content) {
+                Ok(ino) => ino,
+                // Local apply failure: skip this doc rather than wedging the
+                // cursor on it every tick; hydration retries it out-of-band.
+                Err(e) => {
+                    tracing::warn!(path = %ch.path, error = %e, "pull: upsert failed; skipping (hydration will retry)");
+                    fs.hydration()
+                        .enqueue(crate::cache::hydration::HydrationKey::Exact(ch.path.clone()));
+                    return Ok(false);
+                }
+            };
             let remote_ms = parse_iso8601_ms(&ch.updated_at).ok();
             fs.db().set_mirrored_state(ino, remote_ms, Some("ok"), Some(now_ms()));
             fs.db().set_dirty_since(ino, None);
@@ -282,7 +308,18 @@ async fn apply_change(
         // Deleted between the feed page and the body fetch — the tombstone
         // arrives on the next tick; drop it now if we hold a copy.
         Err(ApiError::NotFound) => Ok(fs.apply_deletion(&ch.id).unwrap_or(false)),
-        Err(e) => Err(anyhow::anyhow!("fetch {} failed: {e}", ch.path)),
+        // Transient: abort the page so the unchanged cursor re-delivers it
+        // next tick — nothing is skipped or lost.
+        Err(e) if is_transient(&e) => Err(anyhow::anyhow!("fetch {} failed: {e}", ch.path)),
+        // Deterministic rejection (403/409/422/...): retrying every tick
+        // would stall every change after this one forever. Skip it, let the
+        // hydration queue keep trying in the background.
+        Err(e) => {
+            tracing::warn!(path = %ch.path, error = %e, "pull: fetch rejected; skipping (hydration will retry)");
+            fs.hydration()
+                .enqueue(crate::cache::hydration::HydrationKey::Exact(ch.path.clone()));
+            Ok(false)
+        }
     }
 }
 
@@ -311,7 +348,7 @@ async fn legacy_delta_pull(fs: &Arc<UnisonFs>, api: &Arc<ApiClient>) -> anyhow::
         if !last_seen.is_empty() && doc.updated_at.as_str() <= last_seen.as_str() {
             continue;
         }
-        if reconcile_listed_doc(fs, doc)? {
+        if reconcile_listed_doc(fs, doc) {
             reconciled += 1;
         }
         if doc.updated_at > newest_seen {
@@ -346,7 +383,7 @@ async fn legacy_full_pull(
     let mut newest_seen = String::new();
 
     for doc in &resp.documents {
-        if reconcile_listed_doc(fs, doc)? {
+        if reconcile_listed_doc(fs, doc) {
             reconciled += 1;
         }
         if doc.updated_at > newest_seen {
@@ -370,27 +407,35 @@ async fn legacy_full_pull(
 }
 
 /// Shared legacy-path reconcile of one full doc from `GET /v1/brain/list`.
-fn reconcile_listed_doc(
-    fs: &Arc<UnisonFs>,
-    doc: &crate::api::BrainDocument,
-) -> anyhow::Result<bool> {
+/// Per-doc apply failures are skipped (warn + hydration retry), never
+/// propagated — one bad doc must not abort the batch or stall the watermark
+/// for every doc sorted after it.
+fn reconcile_listed_doc(fs: &Arc<UnisonFs>, doc: &crate::api::BrainDocument) -> bool {
     if let Some(ino) = fs.db().ino_by_remote_path(&doc.path) {
         if let Some(dirty_since) = fs.db().get_dirty_since(ino) {
             if let Ok(remote_ts) = parse_iso8601_ms(&doc.updated_at) {
                 if dirty_since >= remote_ts {
-                    return Ok(false);
+                    return false;
                 }
             }
         }
     }
     let content = doc.body_md.as_deref().unwrap_or("").as_bytes().to_vec();
-    let ino = fs.upsert_brain_doc(&doc.path, &content)?;
+    let ino = match fs.upsert_brain_doc(&doc.path, &content) {
+        Ok(ino) => ino,
+        Err(e) => {
+            tracing::warn!(path = %doc.path, error = %e, "pull: upsert failed; skipping (hydration will retry)");
+            fs.hydration()
+                .enqueue(crate::cache::hydration::HydrationKey::Exact(doc.path.clone()));
+            return false;
+        }
+    };
     let remote_ms = parse_iso8601_ms(&doc.updated_at).ok();
     fs.db().set_mirrored_state(ino, remote_ms, Some("ok"), Some(now_ms()));
     fs.db().set_dirty_since(ino, None);
     fs.db().set_remote_id(ino, &doc.id);
     fs.db().set_remote_content_hash(ino, doc.content_hash.as_deref());
-    Ok(true)
+    true
 }
 
 fn now_ms() -> i64 {

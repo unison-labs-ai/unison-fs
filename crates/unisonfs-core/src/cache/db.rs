@@ -265,7 +265,16 @@ impl Db {
     }
 
     /// Atomically claim the next queued job.
-    pub(crate) fn push_queue_claim_next(&self, now_ms: i64) -> Option<PushJob> {
+    /// Claim the oldest eligible job. `eligible_before_ms` gates on the job's
+    /// `updated_at` — passing `now - settle_window` gives multi-chunk writes a
+    /// quiet period to finish before their (coalesced) job is pushed, since
+    /// every new chunk refreshes `updated_at`. `now_ms` stamps the inflight
+    /// lease.
+    pub(crate) fn push_queue_claim_next(
+        &self,
+        eligible_before_ms: i64,
+        now_ms: i64,
+    ) -> Option<PushJob> {
         let conn = self.conn.lock();
         let row: (String, String, Option<i64>, Option<String>, i64) = conn
             .query_row(
@@ -276,7 +285,7 @@ impl Db {
                     AND updated_at <= ?1
                   ORDER BY updated_at ASC
                   LIMIT 1",
-                [now_ms],
+                [eligible_before_ms],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .ok()?;
@@ -667,7 +676,7 @@ mod tests {
     fn noise_path_skipped() {
         let db = Db::open_in_memory().unwrap();
         db.push_queue_upsert("/foo/._bar.md", PushOp::Write, None, None, 1);
-        assert!(db.push_queue_claim_next(10).is_none());
+        assert!(db.push_queue_claim_next(10, 10).is_none());
     }
 
     #[test]
@@ -680,7 +689,7 @@ mod tests {
             None,
             1,
         );
-        assert!(db.push_queue_claim_next(10).is_some());
+        assert!(db.push_queue_claim_next(10, 10).is_some());
     }
 
     #[test]

@@ -115,7 +115,12 @@ pub async fn mount(
     // listener open even after the kernel detaches the volume (nothing tells
     // a TCP server its client unmounted), so awaiting it alone parks the
     // daemon forever after `umount`. Watch the mount table via statfs and
-    // stop serving once the path is no longer an NFS mount.
+    // stop serving once the path is no longer an NFS mount. A successful
+    // statfs reporting a non-NFS fstype is definitive; a statfs *error* is
+    // not (a soft loopback mount can return transient ESTALE/EIO under
+    // load), so errors only count as detached after several consecutive
+    // misses.
+    let mut consecutive_errors = 0u32;
     loop {
         if serve.is_finished() {
             serve
@@ -123,10 +128,24 @@ pub async fn mount(
                 .map_err(|e| anyhow::anyhow!("nfs serve task panicked: {e}"))??;
             break;
         }
-        if !is_nfs_mounted(mount_path) {
-            tracing::info!("NFS volume detached; stopping server");
-            serve.abort();
-            break;
+        match probe_nfs_mount(mount_path) {
+            MountProbe::Mounted => consecutive_errors = 0,
+            MountProbe::NotMounted => {
+                tracing::info!("NFS volume detached; stopping server");
+                serve.abort();
+                break;
+            }
+            MountProbe::Unknown => {
+                consecutive_errors += 1;
+                if consecutive_errors >= 5 {
+                    tracing::warn!(
+                        "statfs failed {consecutive_errors}x on {}; treating as detached",
+                        mount_path.display()
+                    );
+                    serve.abort();
+                    break;
+                }
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -134,27 +153,39 @@ pub async fn mount(
     Ok(())
 }
 
-/// Whether `path` is currently an attached NFS mount (statfs-based).
 #[cfg(unix)]
-fn is_nfs_mounted(path: &Path) -> bool {
+enum MountProbe {
+    Mounted,
+    NotMounted,
+    Unknown,
+}
+
+/// statfs-based probe: is `path` currently an attached NFS mount?
+#[cfg(unix)]
+fn probe_nfs_mount(path: &Path) -> MountProbe {
     let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
-        return false;
+        return MountProbe::NotMounted;
     };
     #[allow(unsafe_code)]
     unsafe {
         let mut buf: libc::statfs = std::mem::zeroed();
         if libc::statfs(cpath.as_ptr(), &mut buf) != 0 {
-            return false;
+            return MountProbe::Unknown;
         }
         #[cfg(target_os = "macos")]
-        {
+        let is_nfs = {
             let ty = std::ffi::CStr::from_ptr(buf.f_fstypename.as_ptr());
             ty.to_string_lossy().starts_with("nfs")
-        }
+        };
         #[cfg(not(target_os = "macos"))]
-        {
+        let is_nfs = {
             const NFS_SUPER_MAGIC: i64 = 0x6969;
             buf.f_type as i64 == NFS_SUPER_MAGIC
+        };
+        if is_nfs {
+            MountProbe::Mounted
+        } else {
+            MountProbe::NotMounted
         }
     }
 }

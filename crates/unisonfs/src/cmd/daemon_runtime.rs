@@ -191,21 +191,17 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         tokio::spawn(async move {
             unmount_requested.notified().await;
             tracing::info!("shutdown requested via IPC; unmounting {}", mp.display());
+            // Plain (non-force) unmount only: `unisonfs unmount` runs its own
+            // sequence concurrently and owns the force-escalation fallback.
+            // Racing two force unmounts against the same path buys nothing
+            // and can yank the volume out from under in-flight I/O.
             let path = mp.display().to_string();
             #[cfg(target_os = "macos")]
             {
-                let ok = tokio::process::Command::new("/sbin/umount")
+                let _ = tokio::process::Command::new("/sbin/umount")
                     .arg(&path)
                     .status()
-                    .await
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if !ok {
-                    let _ = tokio::process::Command::new("/usr/sbin/diskutil")
-                        .args(["unmount", "force", &path])
-                        .status()
-                        .await;
-                }
+                    .await;
             }
             #[cfg(target_os = "linux")]
             {

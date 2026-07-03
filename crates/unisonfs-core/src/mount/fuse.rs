@@ -604,9 +604,12 @@ pub fn mount(
     config.acl = SessionACL::RootAndOwner;
     let adapter = FuseAdapter::new(fs);
     let session = fuser::Session::new(adapter, mount_path, &config)?;
-    let background = session.spawn()?;
+    // Install the sink BEFORE the session starts serving: the sync engine can
+    // apply a remote change (and emit_inval) the moment the SSE stream
+    // connects, and a notification dropped in that window would leave the
+    // kernel's year-long attr cache stale indefinitely.
     if let Some(target) = inval_target {
-        let notifier = background.notifier();
+        let notifier = session.notifier();
         target.install_inval_sink(Box::new(move |ev: crate::cache::InvalEvent| {
             // ENOENT from the kernel just means "nothing was cached" — fine.
             let _ = notifier.inval_entry(INodeNo(ev.parent_ino), OsStr::new(&ev.name));
@@ -614,6 +617,7 @@ pub fn mount(
             let _ = notifier.inval_inode(INodeNo(ev.ino), 0, 0);
         }));
     }
+    let background = session.spawn()?;
     background.join()?;
     Ok(())
 }

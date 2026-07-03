@@ -55,11 +55,16 @@ impl ProfileFile {
         if silent_ms < STALE_AFTER_MS {
             return None;
         }
+        // Fixed-width minute count: getattr() sizes the file and read() serves
+        // the bytes on separate calls, so a banner whose length shifted as the
+        // number grew digits would make offset reads serve shifted content.
+        // Width 7 covers ~13 years of staleness; the length now only changes
+        // at the (rare) banner appear/disappear transition.
         Some(
             format!(
-                "⚠ SYNC STALE: last successful brain sync was {} minutes ago — \
+                "⚠ SYNC STALE: last successful brain sync was {:>7} minutes ago — \
                  mounted files may not reflect the brain's current state.\n\n",
-                silent_ms / 60_000
+                (silent_ms / 60_000).min(9_999_999)
             )
             .into_bytes(),
         )

@@ -116,13 +116,13 @@ fn push_queue_enqueue_claim_finalize_success() {
     db.push_queue_upsert("/private/notes/push.md", crate::cache::PushOp::Write, Some(ino), None, now);
 
     let job = db
-        .push_queue_claim_next(now + 1)
+        .push_queue_claim_next(now + 1, now + 1)
         .expect("should have a claimable job");
     assert_eq!(job.brain_path, "/private/notes/push.md");
 
     db.push_queue_finalize_success(&job.brain_path, now + 2);
     assert!(
-        db.push_queue_claim_next(now + 3).is_none(),
+        db.push_queue_claim_next(now + 3, now + 3).is_none(),
         "queue should be empty after finalize_success"
     );
 }
@@ -135,12 +135,12 @@ fn push_queue_finalize_failure_increments_attempt() {
 
     let db = fs.db();
     db.push_queue_upsert("/private/notes/retry.md", crate::cache::PushOp::Write, Some(ino), None, now);
-    let job = db.push_queue_claim_next(now + 1).unwrap();
+    let job = db.push_queue_claim_next(now + 1, now + 1).unwrap();
     assert_eq!(job.attempt, 0);
 
     db.push_queue_finalize_failure(&job.brain_path, "transient error", now + 2, 500);
 
-    let job2 = db.push_queue_claim_next(now + 3000).unwrap();
+    let job2 = db.push_queue_claim_next(now + 3000, now + 3000).unwrap();
     assert_eq!(job2.attempt, 1, "attempt should increment after failure");
 }
 
@@ -154,9 +154,9 @@ fn push_queue_coalesces_duplicates() {
     db.push_queue_upsert("/private/notes/coalesce.md", crate::cache::PushOp::Write, Some(ino), None, now);
     db.push_queue_upsert("/private/notes/coalesce.md", crate::cache::PushOp::Write, Some(ino), None, now + 1);
 
-    let _j = db.push_queue_claim_next(now + 2).unwrap();
+    let _j = db.push_queue_claim_next(now + 2, now + 2).unwrap();
     assert!(
-        db.push_queue_claim_next(now + 3).is_none(),
+        db.push_queue_claim_next(now + 3, now + 3).is_none(),
         "second enqueue should have been coalesced"
     );
 }

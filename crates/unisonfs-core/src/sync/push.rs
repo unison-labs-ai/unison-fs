@@ -12,6 +12,12 @@ use crate::cache::{Db, PushOp, UnisonFs};
 const MAX_ATTEMPTS: i64 = 10;
 /// Base backoff in milliseconds.
 const BASE_BACKOFF_MS: i64 = 500;
+/// Quiet period after the last write chunk before a job is pushed. NFSv3
+/// writes a large file as many WRITE RPCs, each of which re-enqueues the
+/// (coalesced) job; without a settle window the worker can PUT a half-written
+/// body. Every chunk refreshes the job's updated_at, so eligibility lands
+/// this long after the LAST chunk.
+const WRITE_SETTLE_MS: i64 = 750;
 /// sync_meta key for the last successful push timestamp.
 const SYNC_META_LAST_PUSH_AT: &str = "last_push_at";
 
@@ -32,7 +38,7 @@ pub async fn run(
             }
         }
 
-        drain_available(&api, &db).await;
+        drain_available(&api, &db, WRITE_SETTLE_MS).await;
     }
 }
 
@@ -54,18 +60,22 @@ pub async fn run_push_worker(fs: Arc<UnisonFs>, mut shutdown: watch::Receiver<bo
                     return;
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            // 1s tick: cheap indexed query, and it's what re-checks jobs
+            // that were dwelling inside the write-settle window.
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
 
-        drain_available(&api, &db).await;
+        drain_available(&api, &db, WRITE_SETTLE_MS).await;
     }
 }
 
 /// Drain all currently-available (non-inflight, not-debounced) queue items.
-async fn drain_available(api: &ApiClient, db: &Db) {
+/// `settle_ms` holds back jobs younger than the write-settle window; the
+/// shutdown drain passes 0 to flush everything immediately.
+async fn drain_available(api: &ApiClient, db: &Db, settle_ms: i64) {
     loop {
         let now_ms = now_ms();
-        let Some(job) = db.push_queue_claim_next(now_ms) else {
+        let Some(job) = db.push_queue_claim_next(now_ms - settle_ms, now_ms) else {
             break;
         };
 
@@ -162,15 +172,11 @@ async fn drain_remaining(api: &ApiClient, db: &Db) {
             break;
         }
 
-        let now_ms = now_ms();
-        if db.push_queue_claim_next(now_ms).is_none() {
-            // Nothing claimable — wait briefly and retry
+        // Flush with no settle window — shutdown must not wait out dwells.
+        drain_available(api, db, 0).await;
+        if db.push_queue_len() > 0 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
         }
-
-        // Put the job back and let drain_available handle it
-        drain_available(api, db).await;
     }
 }
 
